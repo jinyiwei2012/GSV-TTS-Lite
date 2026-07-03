@@ -30,7 +30,7 @@ if platform.system() == "Windows":
     p = psutil.Process(os.getpid())
     p.nice(psutil.HIGH_PRIORITY_CLASS)
 
-from gsv_tts import TTS, AudioClip
+from gsv_tts import TTS, AudioClip, MultiSpeakerTTS, SpeakerConfig, ConfigMismatchError
 
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 logging.getLogger('httpx').setLevel(logging.CRITICAL)
@@ -232,6 +232,215 @@ def load_preset(name):
         return None, "", None, "1.0"
     p = read_preset(name)
     return p["prompt_audio"], p["prompt_text"], p["multi_spk_files"], p["spk_weights"]
+
+
+# ============================================================
+# Multi-Speaker 多角色推理
+# ============================================================
+
+multi_tts: MultiSpeakerTTS | None = None
+_speaker_data: list[dict] = []  # [{name, gpt_path, sovits_path, spk_audio, prompt_audio, prompt_text, mode}]
+
+MULTI_SPK_TEXT_HELP = """支持多角色混用，格式：
+<speaker:角色名>该角色说的文本</speaker:角色名>
+
+示例：
+<speaker:alice>こんにちは、アリスです。</speaker:alice>
+<speaker:bob>よろしくお願いします。</speaker:bob>
+普通文本（使用当前选中角色）"""
+
+
+def multi_init_engine(
+    base_gpt_path, base_sovits_path,
+    use_bert, use_flash_attn,
+    models_dir,
+):
+    """初始化 MultiSpeakerTTS 引擎"""
+    global multi_tts, _speaker_data
+    try:
+        kwargs = {"use_bert": use_bert, "use_flash_attn": use_flash_attn}
+        if models_dir:
+            kwargs["models_dir"] = models_dir
+        if base_gpt_path:
+            kwargs["base_gpt_path"] = base_gpt_path
+        if base_sovits_path:
+            kwargs["base_sovits_path"] = base_sovits_path
+
+        multi_tts = MultiSpeakerTTS(speakers=[], **kwargs)
+        _speaker_data = []
+        return _render_speaker_table(), "✅ 多角色引擎已初始化"
+    except Exception as e:
+        return _render_speaker_table(), f"❌ 初始化失败: {e}"
+
+
+def multi_add_speaker(
+    name, gpt_path, sovits_path,
+    spk_audio, prompt_audio, prompt_text,
+):
+    """添加一个角色到 MultiSpeakerTTS"""
+    global multi_tts, _speaker_data
+    if multi_tts is None:
+        return _render_speaker_table(), "❌ 请先初始化多角色引擎"
+    if not name:
+        return _render_speaker_table(), "❌ 请输入角色名"
+    if not gpt_path or not sovits_path:
+        return _render_speaker_table(), "❌ 请填写 GPT 和 SoVITS 模型路径"
+    if not spk_audio:
+        return _render_speaker_table(), "❌ 请上传音色参考音频"
+
+    try:
+        spk = SpeakerConfig(
+            name=name,
+            gpt_model_path=gpt_path,
+            sovits_model_path=sovits_path,
+            spk_audio_path=spk_audio,
+            prompt_audio_path=prompt_audio or spk_audio,
+            prompt_audio_text=prompt_text,
+        )
+        multi_tts.add_speaker(spk)
+        w = multi_tts._speakers[name]
+        mode = "🔄 完整模型" if w.is_full_model else "✅ 共享骨干"
+        _speaker_data.append({
+            "name": name,
+            "gpt_path": gpt_path,
+            "sovits_path": sovits_path,
+            "spk_audio": spk_audio,
+            "prompt_audio": prompt_audio,
+            "prompt_text": prompt_text,
+            "mode": mode,
+        })
+        return _render_speaker_table(), f"✅ 角色 '{name}' 已添加 ({mode})"
+    except Exception as e:
+        return _render_speaker_table(), f"❌ 添加失败: {e}"
+
+
+def multi_remove_speaker(name):
+    """移除一个角色"""
+    global multi_tts, _speaker_data
+    if multi_tts is None:
+        return _render_speaker_table(), "❌ 请先初始化多角色引擎"
+    if not name:
+        return _render_speaker_table(), "❌ 请选择要移除的角色"
+
+    try:
+        multi_tts.remove_speaker(name)
+        _speaker_data = [s for s in _speaker_data if s["name"] != name]
+        return _render_speaker_table(), f"✅ 角色 '{name}' 已移除"
+    except Exception as e:
+        return _render_speaker_table(), f"❌ 移除失败: {e}"
+
+
+def _render_speaker_table():
+    """渲染角色列表表格"""
+    if not _speaker_data:
+        return gr.update(
+            headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
+            values=[],
+        )
+    rows = [
+        [s["name"], Path(s["gpt_path"]).name, Path(s["sovits_path"]).name, s["mode"]]
+        for s in _speaker_data
+    ]
+    speaker_choices = [s["name"] for s in _speaker_data]
+    return gr.update(headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"], values=rows)
+
+
+def _get_speaker_choices():
+    return gr.update(choices=[s["name"] for s in _speaker_data])
+
+
+def multi_infer(
+    speaker, text,
+    top_k, top_p, temperature, rep_penalty, noise_scale, speed,
+    enable_enhance,
+):
+    """多角色推理——支持 <speaker:name> 标签混用"""
+    global multi_tts
+    if multi_tts is None:
+        return None, "❌ 请先初始化多角色引擎"
+
+    try:
+        start_time = time.time()
+
+        # 解析 <speaker:name>text</speaker:name> 标签
+        tagged = re.findall(r'<speaker:([^>]+)>(.*?)</speaker>', text, re.DOTALL)
+
+        if tagged:
+            # 多角色批量推理
+            speaker_texts = [(spk.strip(), t.strip()) for spk, t in tagged]
+            # 处理标签外的普通文本
+            remaining = re.sub(r'<speaker:[^>]+>.*?</speaker>', '', text, flags=re.DOTALL).strip()
+            if remaining and speaker:
+                # 将未标记文本作为选中角色的内容，插入到合适位置
+                parts = re.split(r'(<speaker:[^>]+>.*?</speaker>)', text)
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    m = re.match(r'<speaker:([^>]+)>(.*?)</speaker>', part)
+                    if m:
+                        speaker_texts.append((m.group(1).strip(), m.group(2).strip()))
+                    else:
+                        speaker_texts.append((speaker, part))
+
+            # 去重排序
+            seen = set()
+            ordered = []
+            for st in speaker_texts:
+                key = (st[0], st[1])
+                if key not in seen:
+                    seen.add(key)
+                    ordered.append(st)
+
+            audios = multi_tts.infer_batched(
+                ordered,
+                top_k=top_k, top_p=top_p, temperature=temperature,
+                repetition_penalty=rep_penalty,
+                noise_scale=noise_scale, speed=speed,
+            )
+
+            samplerate = audios[0].samplerate
+            audio_data = np.concatenate([a.audio_data for a in audios])
+            audio_len_s = sum(a.audio_len_s for a in audios)
+        else:
+            # 单角色推理
+            audio = multi_tts.infer(
+                speaker=speaker,
+                text=text,
+                top_k=top_k, top_p=top_p, temperature=temperature,
+                repetition_penalty=rep_penalty,
+                noise_scale=noise_scale, speed=speed,
+            )
+            samplerate = audio.samplerate
+            audio_data = audio.audio_data
+            audio_len_s = audio.audio_len_s
+
+        if enable_enhance:
+            audio_data = enhance_audio(audio_data, samplerate)
+
+        end_time = time.time()
+        infer_duration = end_time - start_time
+        rtf = infer_duration / audio_len_s if audio_len_s > 0 else 0
+
+        msg = (
+            f"✅ 成功！\n"
+            f"音频时长: {audio_len_s:.2f}s | "
+            f"推理耗时: {infer_duration:.2f}s | "
+            f"RTF: {rtf:.3f}"
+        )
+
+        # Save to history
+        filename = f"multi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.wav"
+        save_path = HISTORY_DIR / filename
+        import soundfile as sf
+        sf.write(str(save_path), audio_data, samplerate)
+
+        return (samplerate, audio_data), msg
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, f"❌ 异常: {e}"
 
 
 def vc_request(
@@ -460,6 +669,128 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
                     vc_output_audio = gr.Audio(label="音色迁移结果", interactive=False)
                     vc_log_output = gr.Textbox(label="处理日志", lines=5)
+
+        with gr.TabItem("多角色推理 (Multi-Speaker) 🆕"):
+            gr.Markdown("### 加载多个微调角色，共享模型骨干，显存节省 50-75%")
+
+            with gr.Group():
+                gr.Markdown("#### 第一步：初始化引擎")
+                with gr.Row():
+                    multi_models_dir = gr.Textbox(label="模型目录 (留空使用默认)", value="", scale=1)
+                    multi_base_gpt = gr.Textbox(label="基 GPT 模型 (留空使用默认 s1v3.ckpt)", value="", scale=1)
+                    multi_base_sovits = gr.Textbox(label="基 SoVITS 模型 (留空使用默认)", value="", scale=1)
+                with gr.Row():
+                    multi_use_bert = gr.Checkbox(label="启用 BERT", value=True)
+                    multi_use_flash = gr.Checkbox(label="启用 Flash Attn (需安装)", value=False)
+                    multi_init_btn = gr.Button("🚀 初始化多角色引擎", variant="primary")
+                    multi_log = gr.Textbox(label="状态", value="尚未初始化", scale=3)
+
+            with gr.Group():
+                gr.Markdown("#### 第二步：管理角色")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        multi_name = gr.Textbox(label="角色名", placeholder="例如: alice")
+                        multi_gpt = gr.Textbox(label="GPT 模型路径 (.ckpt)", placeholder="models/alice_gpt.ckpt")
+                        multi_sovits = gr.Textbox(label="SoVITS 模型路径 (.pth)", placeholder="models/alice_sovits.pth")
+                    with gr.Column(scale=2):
+                        multi_spk_audio = gr.Audio(label="音色参考音频", type="filepath")
+                        multi_prompt_audio = gr.Audio(label="风格参考音频 (可选)", type="filepath")
+                        multi_prompt_text = gr.Textbox(label="风格参考文本 (可选)", placeholder="参考音频对应的文本")
+
+                with gr.Row():
+                    multi_add_btn = gr.Button("➕ 添加角色", variant="secondary")
+                    multi_remove_name = gr.Dropdown(label="选择要移除的角色", choices=[], scale=2, interactive=True)
+                    multi_remove_btn = gr.Button("➖ 移除角色", variant="stop", scale=1)
+
+                multi_table = gr.Dataframe(
+                    headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
+                    label="已加载角色",
+                    interactive=False,
+                )
+
+            with gr.Group():
+                gr.Markdown("#### 第三步：推理")
+                multi_cur_speaker = gr.Dropdown(
+                    label="当前发言角色 (未使用 <speaker:> 标签时的默认角色)",
+                    choices=[],
+                    interactive=True,
+                )
+                multi_text = gr.Textbox(
+                    label="合成目标文本",
+                    lines=5,
+                    value="こんにちは。",
+                    info=MULTI_SPK_TEXT_HELP,
+                )
+                with gr.Row():
+                    multi_enable_enhance = gr.Checkbox(label="启用音频增强", value=False)
+
+                with gr.Accordion("生成参数", open=False):
+                    multi_speed = gr.Slider(0.5, 2.0, 1.0, step=0.1, label="语速")
+                    multi_noise_scale = gr.Slider(0.1, 1.0, 0.5, step=0.05, label="噪声比例")
+                    multi_temperature = gr.Slider(0.1, 1.5, 1.0, label="温度")
+                    multi_top_k = gr.Slider(1, 50, 15, step=1, label="Top K")
+                    multi_top_p = gr.Slider(0.1, 1.0, 1.0, label="Top P")
+                    multi_rep_penalty = gr.Slider(1.0, 2.0, 1.35, label="重复惩罚")
+
+            with gr.Group():
+                multi_btn = gr.Button("🔥 开始合成", variant="primary", size="lg")
+                multi_output_audio = gr.Audio(label="生成的音频结果")
+                multi_output_log = gr.Textbox(label="系统状态信息")
+
+            # ── Multi-Speaker event bindings ──
+            multi_init_btn.click(
+                fn=multi_init_engine,
+                inputs=[
+                    multi_base_gpt, multi_base_sovits,
+                    multi_use_bert, multi_use_flash,
+                    multi_models_dir,
+                ],
+                outputs=[multi_table, multi_log],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_cur_speaker],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_remove_name],
+            )
+
+            multi_add_btn.click(
+                fn=multi_add_speaker,
+                inputs=[
+                    multi_name, multi_gpt, multi_sovits,
+                    multi_spk_audio, multi_prompt_audio, multi_prompt_text,
+                ],
+                outputs=[multi_table, multi_log],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_cur_speaker],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_remove_name],
+            )
+
+            multi_remove_btn.click(
+                fn=multi_remove_speaker,
+                inputs=[multi_remove_name],
+                outputs=[multi_table, multi_log],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_cur_speaker],
+            ).then(
+                fn=_get_speaker_choices,
+                outputs=[multi_remove_name],
+            )
+
+            multi_btn.click(
+                fn=multi_infer,
+                inputs=[
+                    multi_cur_speaker, multi_text,
+                    multi_top_k, multi_top_p, multi_temperature,
+                    multi_rep_penalty, multi_noise_scale, multi_speed,
+                    multi_enable_enhance,
+                ],
+                outputs=[multi_output_audio, multi_output_log],
+            )
 
     def update_history(history_entry, current_history):
         if history_entry is None:
