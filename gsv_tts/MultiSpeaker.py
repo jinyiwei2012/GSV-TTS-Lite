@@ -185,6 +185,11 @@ class MultiSpeakerTTS:
         # ── Active speaker tracking ──
         self._active_speaker: str | None = None
 
+        # ── Weight cache: avoid re-extracting when multiple speakers
+        #     share the same checkpoint (multi-speaker model files)
+        self._weight_cache: dict[tuple[str, str], tuple[dict, dict]] = {}
+        #     key = (gpt_path, sovits_path) → (gpt_weights, sovits_weights)
+
         # ── Expose shared resources ──
         self.audio_queue = self._tts.audio_queue
         self.samplerate = self._tts.samplerate
@@ -260,16 +265,30 @@ class MultiSpeakerTTS:
         weights.prompt_audio_path = spk.prompt_audio_path or spk.spk_audio_path
         weights.prompt_audio_text = spk.prompt_audio_text
 
-        # Extract model weights from checkpoints
-        weights.gpt_weights = extract_speaker_gpt_weights(
-            spk.gpt_model_path,
-            self._tts.tts_config,
-            shared_layers=self._shared_gpt_layers,
-        )
-        weights.sovits_weights = extract_speaker_sovits_weights(
-            spk.sovits_model_path,
-            self._tts.tts_config,
-        )
+        # Extract model weights from checkpoints (with caching)
+        cache_key = (spk.gpt_model_path, spk.sovits_model_path)
+        if cache_key in self._weight_cache:
+            cached_gpt, cached_sovits = self._weight_cache[cache_key]
+            weights.gpt_weights = cached_gpt
+            weights.sovits_weights = cached_sovits
+            logger.info(
+                f"  Speaker '{spk.name}' reusing cached weights "
+                f"from checkpoint (shared with another speaker)"
+            )
+        else:
+            weights.gpt_weights = extract_speaker_gpt_weights(
+                spk.gpt_model_path,
+                self._tts.tts_config,
+                shared_layers=self._shared_gpt_layers,
+            )
+            weights.sovits_weights = extract_speaker_sovits_weights(
+                spk.sovits_model_path,
+                self._tts.tts_config,
+            )
+            self._weight_cache[cache_key] = (
+                weights.gpt_weights,
+                weights.sovits_weights,
+            )
 
         # Pre-compute speaker embedding (ge) via the SoVITS model
         # We load the full SoVITS model temporarily to get ge, then discard it
@@ -473,11 +492,21 @@ class MultiSpeakerTTS:
 
         This is safe for CUDA Graphs because copy_() modifies tensor values
         in-place without changing memory addresses.
+
+        Skips injection if the new speaker shares the same model checkpoint
+        as the currently active speaker (multi-speaker checkpoint optimization).
         """
         if self._active_speaker == name:
             return
 
         w = self._speakers[name]
+        old_w = self._speakers.get(self._active_speaker) if self._active_speaker else None
+
+        # If both speakers share the same model weights, skip injection
+        if old_w is not None and w.gpt_weights is old_w.gpt_weights:
+            self._active_speaker = name
+            return
+
         device = self._tts.tts_config.device
         dtype = self._tts.tts_config.dtype
 
