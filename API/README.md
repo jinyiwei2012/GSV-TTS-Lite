@@ -271,6 +271,87 @@ A: 检查 URL 是否可访问，确保网络连接正常。`httpx` 默认超时�
 
 A: 可以手动提供 `prompt_text` 参数，或者确保 `prompt_audio` 音质清晰。
 
+## 🎯 6.5. 多角色推理 API (Multi-Speaker) 🆕
+
+`MultiSpeakerTTS` 支持在同一服务中加载多个微调角色，共享模型骨干，显存节省 50-75%。
+
+### 接口列表
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/multi-speaker/init` | 初始化多角色引擎 |
+| POST | `/multi-speaker/add` | 添加角色 |
+| POST | `/multi-speaker/remove` | 移除角色 |
+| GET  | `/multi-speaker/list` | 列出已加载角色 |
+| POST | `/multi-speaker/infer` | 单角色推理 |
+| POST | `/multi-speaker/batch` | 多角色批量推理 |
+
+### 使用流程
+
+**1. 初始化引擎**
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/init" \
+  -H "Content-Type: application/json" \
+  -d '{"use_bert": true, "use_flash_attn": false}'
+```
+
+**2. 添加角色**
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/add" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "alice",
+    "gpt_model_path": "models/alice_gpt.ckpt",
+    "sovits_model_path": "models/alice_sovits.pth",
+    "speaker_audio": "audio/alice_ref.wav",
+    "prompt_audio": "audio/alice_prompt.ogg",
+    "prompt_text": "こんにちは、アリスです。"
+  }'
+```
+> 响应会返回 `mode`：`shared`（共享骨干）或 `full_model_degraded`（自动降级为完整模型）
+
+**3. 查看已加载角色**
+```bash
+curl "http://localhost:8000/multi-speaker/list"
+```
+```json
+{
+  "initialized": true,
+  "speakers": [
+    {"name": "alice", "mode": "shared", "gpt_keys": 25, "sovits_keys": 37},
+    {"name": "bob",   "mode": "full_model", "gpt_keys": 0, "sovits_keys": 0}
+  ]
+}
+```
+
+**4. 单角色推理**
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/infer" \
+  -H "Content-Type: application/json" \
+  -d '{"speaker": "alice", "text": "こんにちは！"}'
+```
+
+**5. 多角色批量推理**
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/batch" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker_texts": [
+      {"speaker": "alice", "text": "こんにちは"},
+      {"speaker": "bob",   "text": "よろしく"}
+    ]
+  }'
+```
+> 相同角色自动 GPU 并行，不同角色按组分别批量处理。
+
+### 自动兼容性
+
+- 加载时自动校验角色模型与基模型的 13 个架构参数
+- 不兼容的角色**自动降级**为完整模型加载（~800MB VRAM），不影响其他角色
+- v2Pro 和 v2ProPlus 在结构参数匹配时互相兼容
+
+---
+
 ## 🎯 7. 最佳实践
 
 1. **服务端部署**：使用 FastAPI 示例，提供 RESTful API
