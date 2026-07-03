@@ -229,7 +229,14 @@ class MultiSpeakerTTS:
         # ── Validate config compatibility before anything else ──
         _, spk_gpt_config = _load_gpt_state_dict(spk.gpt_model_path)
         _, spk_sovits_hps = _load_sovits_state_dict(spk.sovits_model_path)
-        self._validate_config(spk.name, spk_gpt_config, spk_sovits_hps)
+        try:
+            self._validate_config(spk.name, spk_gpt_config, spk_sovits_hps)
+        except ConfigMismatchError as e:
+            logger.warning(
+                f"Speaker '{spk.name}' config mismatch — "
+                f"falling back to full model loading: {e}"
+            )
+            return self._add_full_model_speaker(spk)
 
         weights = SpeakerWeights(name=spk.name)
         weights.spk_audio_path = spk.spk_audio_path
@@ -281,6 +288,59 @@ class MultiSpeakerTTS:
             f"  Speaker '{spk.name}' ready: "
             f"{len(weights.gpt_weights)} GPT keys, "
             f"{len(weights.sovits_weights)} SoVITS keys"
+        )
+
+    def _add_full_model_speaker(self, spk: SpeakerConfig):
+        """Load full standalone models for an incompatible speaker.
+
+        Used as degradation fallback when a speaker's model config doesn't
+        match the base model. Occupies ~800MB VRAM per speaker instead of
+        the ~120MB shared-backbone approach.
+        """
+        weights = SpeakerWeights(
+            name=spk.name,
+            is_full_model=True,
+            spk_audio_path=spk.spk_audio_path,
+            prompt_audio_path=spk.prompt_audio_path or spk.spk_audio_path,
+            prompt_audio_text=spk.prompt_audio_text,
+            gpt_model_key=spk.gpt_model_path,
+            sovits_model_key=spk.sovits_model_path,
+        )
+
+        # Load full models into the underlying TTS instance
+        self._tts.load_gpt_model(spk.gpt_model_path)
+        self._tts.load_sovits_model(spk.sovits_model_path)
+
+        # Pre-compute speaker embedding (ge)
+        self._tts.cache_spk_audio(
+            spk.spk_audio_path, sovits_model=spk.sovits_model_path
+        )
+        spk_cache = self._tts.spk_audio_cache[spk.spk_audio_path]
+        weights.ge = spk_cache["ge"][spk.sovits_model_path]
+        weights.sv_emb = spk_cache.get("sv_emb")
+
+        # Pre-compute prompt features (if configured)
+        prompt_audio = spk.prompt_audio_path or spk.spk_audio_path
+        prompt_text = spk.prompt_audio_text
+        if prompt_text is not None:
+            self._tts.cache_prompt_audio(
+                prompt_audio_paths=prompt_audio,
+                prompt_audio_texts=prompt_text,
+            )
+            prompt_cache = self._tts.prompt_audio_cache[prompt_audio]
+            weights.prompt = prompt_cache["prompt"]
+            weights.phones1 = prompt_cache["phones1"]
+            weights.bert1 = prompt_cache["bert1"]
+        else:
+            logger.warning(
+                f"Speaker '{spk.name}' has no prompt_audio_text — "
+                "prompt features will need to be provided at inference time."
+            )
+
+        self._speakers[spk.name] = weights
+        logger.info(
+            f"  Speaker '{spk.name}' ready (full model — "
+            f"config incompatible with base)"
         )
 
     def add_speaker(self, spk: SpeakerConfig):
@@ -420,6 +480,47 @@ class MultiSpeakerTTS:
     # Inference
     # ==================================================================
 
+    def _register_full_model_cache(
+        self,
+        speaker: str,
+        require_prompt: bool = True,
+    ) -> tuple[str, str | None, str, str, str]:
+        """Register cached features for a full-model speaker.
+
+        Returns (spk_key, prompt_key, prompt_text, gpt_model_key, sovits_model_key).
+        """
+        w = self._require_speaker(speaker)
+        if w.ge is None:
+            raise ValueError(f"Speaker '{speaker}' has no cached speaker embedding.")
+        if require_prompt and (w.prompt is None or w.phones1 is None or w.bert1 is None):
+            raise ValueError(
+                f"Speaker '{speaker}' has no cached prompt features. "
+                "Set prompt_audio_text in SpeakerConfig."
+            )
+
+        spk_key = self._spk_cache_key(speaker)
+        self._tts.spk_audio_cache[spk_key] = {
+            "ge": {w.sovits_model_key: w.ge},
+            "sv_emb": w.sv_emb,
+        }
+
+        prompt_key = None
+        if w.prompt is not None and w.phones1 is not None and w.bert1 is not None:
+            prompt_key = self._prompt_cache_key(speaker)
+            self._tts.prompt_audio_cache[prompt_key] = {
+                "prompt": w.prompt,
+                "phones1": w.phones1,
+                "bert1": w.bert1,
+            }
+
+        return (
+            spk_key,
+            prompt_key,
+            w.prompt_audio_text or "",
+            w.gpt_model_key,
+            w.sovits_model_key,
+        )
+
     @torch.inference_mode()
     def infer(
         self,
@@ -452,6 +553,49 @@ class MultiSpeakerTTS:
             AudioClip with generated audio.
         """
         with self._tts._infer_lock:
+            w = self._require_speaker(speaker)
+
+            if w.is_full_model:
+                # Full-model speaker — no weight injection needed
+                require_prompt = (
+                    prompt_audio_path is None or prompt_audio_text is None
+                )
+                (
+                    spk_key,
+                    prompt_key,
+                    cached_prompt_text,
+                    gpt_key,
+                    sovits_key,
+                ) = self._register_full_model_cache(
+                    speaker, require_prompt=require_prompt
+                )
+
+                if prompt_audio_path is None and prompt_audio_text is None:
+                    prompt_audio_path = prompt_key
+                    prompt_audio_text = cached_prompt_text
+                elif prompt_audio_path is None or prompt_audio_text is None:
+                    raise ValueError(
+                        "prompt_audio_path and prompt_audio_text "
+                        "must be provided together."
+                    )
+
+                return self._tts.infer(
+                    spk_audio_path=spk_key,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    return_subtitles=return_subtitles,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    gpt_model=gpt_key,
+                    sovits_model=sovits_key,
+                )
+
+            # Shared-backbone speaker — inject weights + use shared models
             require_prompt = prompt_audio_path is None or prompt_audio_text is None
             with self._activate_shared_models(speaker, require_prompt=require_prompt) as (
                 spk_key,

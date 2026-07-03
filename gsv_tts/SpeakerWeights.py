@@ -111,3 +111,19 @@ class SpeakerWeights:
     Used by SoVITS.get_ge() for v2Pro+ models. Stored per audio_path
     but cached here for convenience during inference.
     """
+
+    # ── Degradation mode (config mismatch fallback) ──
+
+    is_full_model: bool = False
+    """Whether this speaker uses full standalone models (not shared backbone).
+
+    Set when the speaker's model config is incompatible with the base model.
+    Full-model speakers occupy more VRAM (~800MB vs ~120MB) but preserve
+    full inference quality.
+    """
+
+    gpt_model_key: str | None = None
+    """TTS.gpt_models key for full-model speakers."""
+
+    sovits_model_key: str | None = None
+    """TTS.sovits_models key for full-model speakers."""
