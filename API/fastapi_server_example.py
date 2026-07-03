@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from gsv_tts import TTS
+from gsv_tts import TTS, MultiSpeakerTTS, SpeakerConfig, ConfigMismatchError
 import uuid
 import os
 import tempfile
@@ -27,6 +27,7 @@ output_dir = project_root / "output"
 output_dir.mkdir(exist_ok=True)
 
 tts: Optional[TTS] = None
+multi_tts: Optional[MultiSpeakerTTS] = None
 asr = None
 
 temp_dir = tempfile.mkdtemp(prefix="gsv_tts_")
@@ -106,6 +107,46 @@ class TTSBatchRequest(BaseModel):
     repetition_penalty: float = 1.35
     noise_scale: float = 0.5
     speed: float = 1.0
+
+
+# ============================================================
+# Multi-Speaker API models
+# ============================================================
+
+class MultiInitRequest(BaseModel):
+    base_gpt_path: Optional[str] = None
+    base_sovits_path: Optional[str] = None
+    use_bert: bool = True
+    use_flash_attn: bool = False
+
+
+class MultiAddSpeakerRequest(BaseModel):
+    name: str
+    gpt_model_path: str
+    sovits_model_path: str
+    speaker_audio: str
+    prompt_audio: Optional[str] = None
+    prompt_text: Optional[str] = None
+
+
+class MultiRemoveSpeakerRequest(BaseModel):
+    name: str
+
+
+class MultiInferRequest(BaseModel):
+    speaker: str
+    text: str
+    top_k: int = 5
+    top_p: float = 0.9
+    temperature: float = 1.0
+    repetition_penalty: float = 1.35
+    noise_scale: float = 0.5
+    speed: float = 1.0
+
+
+class MultiBatchRequest(BaseModel):
+    speaker_texts: List[MultiInferRequest]
+    """List of (speaker, text) pairs for multi-speaker batch inference."""
 
 
 @app.on_event("startup")
@@ -288,6 +329,183 @@ async def get_audio(filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件未找到")
     return FileResponse(file_path, media_type="audio/wav")
+
+
+# ============================================================
+# Multi-Speaker API endpoints
+# ============================================================
+
+@app.post("/multi-speaker/init")
+async def multi_init(request: MultiInitRequest):
+    """Initialize MultiSpeakerTTS engine with shared backbone."""
+    global multi_tts
+    try:
+        kwargs = {
+            "use_bert": request.use_bert,
+            "use_flash_attn": request.use_flash_attn,
+        }
+        if request.base_gpt_path:
+            kwargs["base_gpt_path"] = request.base_gpt_path
+        if request.base_sovits_path:
+            kwargs["base_sovits_path"] = request.base_sovits_path
+
+        multi_tts = MultiSpeakerTTS(speakers=[], **kwargs)
+        return {"success": True, "message": "MultiSpeakerTTS engine initialized"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/add")
+async def multi_add(request: MultiAddSpeakerRequest):
+    """Add a speaker to the MultiSpeakerTTS engine."""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="MultiSpeakerTTS not initialized. Call /multi-speaker/init first.")
+
+    try:
+        speaker_audio = request.speaker_audio
+        prompt_audio = request.prompt_audio
+        prompt_text = request.prompt_text
+
+        if is_url(speaker_audio):
+            speaker_audio = await download_audio(speaker_audio)
+        if prompt_audio and is_url(prompt_audio):
+            prompt_audio = await download_audio(prompt_audio)
+
+        spk = SpeakerConfig(
+            name=request.name,
+            gpt_model_path=request.gpt_model_path,
+            sovits_model_path=request.sovits_model_path,
+            spk_audio_path=speaker_audio,
+            prompt_audio_path=prompt_audio or speaker_audio,
+            prompt_audio_text=prompt_text,
+        )
+        multi_tts.add_speaker(spk)
+        w = multi_tts._speakers[request.name]
+        mode = "shared" if not w.is_full_model else "full_model_degraded"
+
+        return {
+            "success": True,
+            "name": request.name,
+            "mode": mode,
+            "message": f"Speaker '{request.name}' added ({mode})",
+        }
+    except ConfigMismatchError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Config mismatch (speaker loaded as full model): {e}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/remove")
+async def multi_remove(request: MultiRemoveSpeakerRequest):
+    """Remove a speaker from the MultiSpeakerTTS engine."""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        multi_tts.remove_speaker(request.name)
+        return {"success": True, "message": f"Speaker '{request.name}' removed"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/multi-speaker/list")
+async def multi_list():
+    """List all loaded speakers with their mode."""
+    global multi_tts
+    if multi_tts is None:
+        return {"initialized": False, "speakers": []}
+
+    speakers = []
+    for name in multi_tts.speaker_names:
+        w = multi_tts._speakers[name]
+        speakers.append({
+            "name": name,
+            "mode": "full_model" if w.is_full_model else "shared",
+            "gpt_keys": len(w.gpt_weights) if not w.is_full_model else 0,
+            "sovits_keys": len(w.sovits_weights) if not w.is_full_model else 0,
+        })
+
+    return {"initialized": True, "speakers": speakers}
+
+
+@app.post("/multi-speaker/infer")
+async def multi_infer(request: MultiInferRequest):
+    """Single-speaker inference via MultiSpeakerTTS."""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        audio_clip = multi_tts.infer(
+            speaker=request.speaker,
+            text=request.text,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            temperature=request.temperature,
+            repetition_penalty=request.repetition_penalty,
+            noise_scale=request.noise_scale,
+            speed=request.speed,
+        )
+
+        filename = f"multi_{uuid.uuid4().hex[:8]}.wav"
+        output_path = output_dir / filename
+        audio_clip.save(str(output_path))
+
+        return {
+            "success": True,
+            "speaker": request.speaker,
+            "audio_len": audio_clip.audio_len_s,
+            "filename": filename,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/batch")
+async def multi_batch(request: MultiBatchRequest):
+    """Multi-speaker batch inference.
+
+    Example body:
+    {
+        "speaker_texts": [
+            {"speaker": "alice", "text": "こんにちは"},
+            {"speaker": "bob",   "text": "よろしく"}
+        ]
+    }
+    """
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        speaker_texts = [(req.speaker, req.text) for req in request.speaker_texts]
+        audio_clips = multi_tts.infer_batched(speaker_texts)
+
+        filenames = []
+        for clip in audio_clips:
+            filename = f"multi_{uuid.uuid4().hex[:8]}.wav"
+            output_path = output_dir / filename
+            clip.save(str(output_path))
+            filenames.append(filename)
+
+        return {
+            "success": True,
+            "count": len(audio_clips),
+            "filenames": filenames,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
