@@ -52,7 +52,7 @@
 
 この制限を打破するため、**GSV-TTS-Lite** が生まれました。これは **GPT-SoVITS (V2/V2Pro/V2ProPlus)** に基づいて開発された推論バックエンドです。いくつかの深層最適化技術により、本プロジェクトは低 VRAM 環境においてミリ秒級のリアルタイム応答を実現しました。
 
-パフォーマンスの飛躍に加え、**GSV-TTS-Lite** は**音色とスタイルの分離**を実現し、話者の音色と感情を独立して制御可能にしました。さらに、**文字単位のタイムスタンプ同期**や**音色変換**などの特有機能を追加しました。
+パフォーマンスの飛躍に加え、**GSV-TTS-Lite** は**音色とスタイルの分離**を実現し、話者の音色と感情を独立して制御可能にしました。さらに、**文字単位のタイムスタンプ同期**、**音色変換**、**マルチスピーカー共有骨格推論**などの特有機能を追加しました。
 
 開発者の統合を容易にするため、**GSV-TTS-Lite** はコードアーキテクチャを大幅に簡素化し、`gsv-tts-lite` ライブラリとして PyPI に公開されました。`pip` によるワンクリックインストールをサポートしています。
 
@@ -117,6 +117,8 @@ pip install gsv-tts-lite==0.4.5
   ```bash
   python web.py
   ```
+> [!TIP]
+> WebUI は**単一モデル / マルチスピーカー**の 2 つの推論モードをワンクリックで切替可能。マルチスピーカーモードでは `<speaker:キャラ名>テキスト</speaker:キャラ名>` タグによる混在合成と自動 GPU バッチ並列処理をサポート。
 
 ### API サービスインターフェース
 
@@ -127,6 +129,9 @@ pip install gsv-tts-lite==0.4.5
   ```
 2. **コアドキュメント**：
    [API 詳細ガイドディレクトリへ ➔](https://github.com/chinokikiss/GSV-TTS-Lite/tree/main/API)
+
+> [!TIP]
+> FastAPI サーバーに **6 つの MultiSpeaker エンドポイント**（`/multi-speaker/init`、`/multi-speaker/add`、`/multi-speaker/remove`、`/multi-speaker/list`、`/multi-speaker/infer`、`/multi-speaker/batch`）を追加。マルチスピーカー管理とバッチ推論に対応。
 
 ### Python SDK インターフェース呼び出し
 

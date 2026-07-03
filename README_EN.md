@@ -52,7 +52,7 @@ The original motivation for this project was the pursuit of ultimate performance
 
 To break through these limitations, **GSV-TTS-Lite** was developed as an inference backend based on **GPT-SoVITS (V2/V2Pro/V2ProPlus)**. Through deep optimization techniques, this project successfully achieves millisecond-level real-time response in low-VRAM environments.
 
-Beyond the leap in performance, **GSV-TTS-Lite** implements the **decoupling of timbre and style**, supporting independent control over the speaker's voice and emotion. It also features **character-level timestamps alignment** and **voice conversion (timbre transfer)**.
+Beyond the leap in performance, **GSV-TTS-Lite** implements the **decoupling of timbre and style**, supporting independent control over the speaker's voice and emotion. It also features **character-level timestamps alignment**, **voice conversion (timbre transfer)**, and **multi-speaker shared-backbone inference**.
 
 To facilitate integration for developers, **GSV-TTS-Lite** features a significantly streamlined code architecture and is available on PyPI as the `gsv-tts-lite` library, supporting one-click installation via `pip`.
 
@@ -117,6 +117,8 @@ pip install gsv-tts-lite==0.4.5
   ```bash
   python web.py
   ```
+> [!TIP]
+> WebUI supports **single-model / multi-speaker** modes with one-click toggle. Multi-speaker mode supports `<speaker:name>text</speaker:name>` tags for mixed-speaker synthesis with automatic GPU batch parallelism.
 
 ### API Service Interface
 
@@ -127,6 +129,9 @@ pip install gsv-tts-lite==0.4.5
   ```
 2. **Core Documentation**：
    [Go to API Detailed Guide Directory ➔](https://github.com/chinokikiss/GSV-TTS-Lite/tree/main/API)
+
+> [!TIP]
+> FastAPI server now includes **6 MultiSpeaker endpoints** (`/multi-speaker/init`, `/multi-speaker/add`, `/multi-speaker/remove`, `/multi-speaker/list`, `/multi-speaker/infer`, `/multi-speaker/batch`) for multi-speaker management and batch inference.
 
 ### Python SDK Interface
 

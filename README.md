@@ -52,7 +52,7 @@
 
 为了打破这一限制，**GSV-TTS-Lite** 应运而生，它是基于 **GPT-SoVITS (V2/V2Pro/V2ProPlus)** 开发的推理后端。通过一些深度优化技术，本项目成功在低显存环境下实现了毫秒级的实时响应。
 
-除了性能上的飞跃，**GSV-TTS-Lite** 还实现了**音色与风格的解耦**，支持独立控制说话人的音色与情感，并加入了**字级时间戳对齐**与**音色迁移**等特色功能。
+除了性能上的飞跃，**GSV-TTS-Lite** 还实现了**音色与风格的解耦**，支持独立控制说话人的音色与情感，并加入了**字级时间戳对齐**、**音色迁移**以及**多角色共享骨干推理**等特色功能。
 
 为了便于开发者集成，**GSV-TTS-Lite** 大幅精简了代码架构，并已作为 `gsv-tts-lite` 库发布至 PyPI，支持通过 `pip` 一键安装。
 
@@ -117,6 +117,8 @@ pip install gsv-tts-lite==0.4.5
   ```bash
   python web.py
   ```
+> [!TIP]
+> WebUI 支持**单模型/多角色**两种推理模式，一键切换。多角色模式下支持 `<speaker:角色名>文本</speaker:角色名>` 标签混用，自动 GPU 批量并行。
 
 ### API 服务接口
 
@@ -127,6 +129,9 @@ pip install gsv-tts-lite==0.4.5
   ```
 2. **核心文档**：
    [进入 API 详细指南目录 ➔](https://github.com/chinokikiss/GSV-TTS-Lite/tree/main/API)
+
+> [!TIP]
+> FastAPI 服务新增 **6 个 MultiSpeaker 端点**（`/multi-speaker/init`、`/multi-speaker/add`、`/multi-speaker/remove`、`/multi-speaker/list`、`/multi-speaker/infer`、`/multi-speaker/batch`），支持多角色管理与批量推理。
 
 ### Python SDK 接口调用
 
