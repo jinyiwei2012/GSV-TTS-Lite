@@ -25,7 +25,7 @@ from torch.nn import functional as F
 from safetensors.torch import save_model
 
 from .Loader import get_gpt_weights, get_sovits_weights, Gpt, Sovits
-from .Download import check_pretrained_models, download_model, download_cnroberta_int8
+from .Download import check_pretrained_models, ensure_default_models, download_model, download_cnroberta_int8
 from .TextProcessor import get_phones_and_bert, cut_text, sub2text_index
 from .GPT_SoVITS.Featurizer import CNHubert, CNRoberta
 from .GPT_SoVITS.SV import ERes2Net
@@ -115,7 +115,8 @@ class TTS:
         self.default_sovits_path = Path(self.models_dir) / "s2Gv2ProPlus.pth"
 
         check_pretrained_models(self.models_dir)
-        
+        ensure_default_models(self.models_dir)
+
         self._bert_loaded = False
         if use_bert:
             # CPU 场景：下载 INT8 ONNX 模型
