@@ -52,8 +52,14 @@ _SOVITS_CRITICAL_KEYS = [
     ("model", "filter_channels"),
     ("model", "n_heads"),
     ("model", "n_layers"),
+    ("model", "upsample_initial_channel"),
     ("model", "version"),
 ]
+
+# v2Pro and v2ProPlus share identical code paths in is_v2pro/sv_emb/ge_to512/prelu,
+# but may differ in structural dims like upsample_initial_channel.
+# The explicit structural key checks above catch those cases.
+_SOVITS_COMPATIBLE_VERSIONS = frozenset({"v2Pro", "v2ProPlus"})
 
 
 class ConfigMismatchError(ValueError):
@@ -217,6 +223,17 @@ class MultiSpeakerTTS:
             base_val = self._base_sovits_hps[section][key]
             spk_val = sovits_hps[section][key]
             if base_val != spk_val:
+                # v2Pro ↔ v2ProPlus are architecturally identical
+                if (
+                    key == "version"
+                    and base_val in _SOVITS_COMPATIBLE_VERSIONS
+                    and spk_val in _SOVITS_COMPATIBLE_VERSIONS
+                ):
+                    logger.info(
+                        f"Speaker '{spk_name}': version {spk_val} is "
+                        f"compatible with base {base_val} (same architecture)"
+                    )
+                    continue
                 raise ConfigMismatchError(
                     f"Speaker '{spk_name}' SoVITS config mismatch: "
                     f"{section}.{key}={spk_val}, base={base_val}"
