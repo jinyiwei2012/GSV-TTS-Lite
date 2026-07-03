@@ -10,12 +10,12 @@ Core idea:
 from __future__ import annotations
 
 import logging
-import threading
+from contextlib import contextmanager
+from collections import defaultdict
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Literal
 
 import torch
-import numpy as np
 
 from .TTS import TTS
 from .SpeakerWeights import SpeakerConfig, SpeakerWeights
@@ -25,11 +25,13 @@ from .Loader import (
     load_shared_gpt,
     load_shared_sovits,
 )
-from .TextProcessor import get_phones_and_bert, sub2text_index
 from .Player import AudioClip
 
 
 logger = logging.getLogger(__name__)
+
+_SHARED_GPT_KEY = "__multi_speaker_shared_gpt__"
+_SHARED_SOVITS_KEY = "__multi_speaker_shared_sovits__"
 
 
 def _resolve_param(model: torch.nn.Module, param_path: str) -> torch.nn.Parameter:
@@ -157,6 +159,9 @@ class MultiSpeakerTTS:
     def _add_speaker(self, spk: SpeakerConfig):
         """Extract and cache speaker-specific weights and features."""
         weights = SpeakerWeights(name=spk.name)
+        weights.spk_audio_path = spk.spk_audio_path
+        weights.prompt_audio_path = spk.prompt_audio_path or spk.spk_audio_path
+        weights.prompt_audio_text = spk.prompt_audio_text
 
         # Extract model weights from checkpoints
         weights.gpt_weights = extract_speaker_gpt_weights(
@@ -225,6 +230,90 @@ class MultiSpeakerTTS:
         """List all registered speaker names."""
         return list(self._speakers.keys())
 
+    def _spk_cache_key(self, speaker: str) -> str:
+        return f"__multi_speaker_spk__:{speaker}"
+
+    def _prompt_cache_key(self, speaker: str) -> str:
+        return f"__multi_speaker_prompt__:{speaker}"
+
+    def _require_speaker(self, speaker: str) -> SpeakerWeights:
+        if speaker not in self._speakers:
+            raise ValueError(f"Speaker '{speaker}' not found.")
+        return self._speakers[speaker]
+
+    def _register_cached_features(
+        self,
+        speaker: str,
+        require_prompt: bool = True,
+    ) -> tuple[str, str | None, str]:
+        w = self._require_speaker(speaker)
+        if w.ge is None:
+            raise ValueError(f"Speaker '{speaker}' has no cached speaker embedding.")
+        if require_prompt and (w.prompt is None or w.phones1 is None or w.bert1 is None):
+            raise ValueError(
+                f"Speaker '{speaker}' has no cached prompt features. "
+                "Provide prompt_audio_path + prompt_audio_text, "
+                "or set them in SpeakerConfig."
+            )
+
+        spk_key = self._spk_cache_key(speaker)
+        self._tts.spk_audio_cache[spk_key] = {
+            "ge": {_SHARED_SOVITS_KEY: w.ge},
+            "sv_emb": w.sv_emb,
+        }
+        prompt_key = None
+        if w.prompt is not None and w.phones1 is not None and w.bert1 is not None:
+            prompt_key = self._prompt_cache_key(speaker)
+            self._tts.prompt_audio_cache[prompt_key] = {
+                "prompt": w.prompt,
+                "phones1": w.phones1,
+                "bert1": w.bert1,
+            }
+        return spk_key, prompt_key, w.prompt_audio_text or ""
+
+    @contextmanager
+    def _activate_shared_models(self, speaker: str, require_prompt: bool = True):
+        """Expose active shared models and cached features to the underlying TTS API."""
+        self._require_speaker(speaker)
+        had_gpt = _SHARED_GPT_KEY in self._tts.gpt_models
+        had_sovits = _SHARED_SOVITS_KEY in self._tts.sovits_models
+        had_spk = self._spk_cache_key(speaker) in self._tts.spk_audio_cache
+        had_prompt = self._prompt_cache_key(speaker) in self._tts.prompt_audio_cache
+        old_gpt = self._tts.gpt_models.get(_SHARED_GPT_KEY)
+        old_sovits = self._tts.sovits_models.get(_SHARED_SOVITS_KEY)
+        old_spk = self._tts.spk_audio_cache.get(self._spk_cache_key(speaker))
+        old_prompt = self._tts.prompt_audio_cache.get(self._prompt_cache_key(speaker))
+
+        try:
+            self._apply_speaker(speaker)
+            self._tts.gpt_models[_SHARED_GPT_KEY] = self._shared_gpt
+            self._tts.sovits_models[_SHARED_SOVITS_KEY] = self._shared_sovits
+            spk_key, prompt_key, prompt_text = self._register_cached_features(
+                speaker,
+                require_prompt=require_prompt,
+            )
+            yield spk_key, prompt_key, prompt_text
+        finally:
+            if had_gpt:
+                self._tts.gpt_models[_SHARED_GPT_KEY] = old_gpt
+            else:
+                self._tts.gpt_models.pop(_SHARED_GPT_KEY, None)
+
+            if had_sovits:
+                self._tts.sovits_models[_SHARED_SOVITS_KEY] = old_sovits
+            else:
+                self._tts.sovits_models.pop(_SHARED_SOVITS_KEY, None)
+
+            if had_spk:
+                self._tts.spk_audio_cache[self._spk_cache_key(speaker)] = old_spk
+            else:
+                self._tts.spk_audio_cache.pop(self._spk_cache_key(speaker), None)
+
+            if had_prompt:
+                self._tts.prompt_audio_cache[self._prompt_cache_key(speaker)] = old_prompt
+            else:
+                self._tts.prompt_audio_cache.pop(self._prompt_cache_key(speaker), None)
+
     # ==================================================================
     # Weight injection
     # ==================================================================
@@ -290,113 +379,35 @@ class MultiSpeakerTTS:
             AudioClip with generated audio.
         """
         with self._tts._infer_lock:
-            self._apply_speaker(speaker)
-            w = self._speakers[speaker]
+            require_prompt = prompt_audio_path is None or prompt_audio_text is None
+            with self._activate_shared_models(speaker, require_prompt=require_prompt) as (
+                spk_key,
+                prompt_key,
+                cached_prompt_text,
+            ):
+                if prompt_audio_path is None and prompt_audio_text is None:
+                    prompt_audio_path = prompt_key
+                    prompt_audio_text = cached_prompt_text
+                elif prompt_audio_path is None or prompt_audio_text is None:
+                    raise ValueError(
+                        "prompt_audio_path and prompt_audio_text must be provided together."
+                    )
 
-            # Text pre-processing
-            if self._tts._contains_chinese(text):
-                self._tts._ensure_bert_loaded()
-            if not self._tts._check_pause(text):
-                text += "."
-
-            if len(text) > 20:
-                logger.info(f"[{speaker}] Starting inference: '{text[:20]}...'")
-            else:
-                logger.info(f"[{speaker}] Starting inference: '{text}'")
-
-            # Prompt features (use override or cached)
-            if prompt_audio_path is not None and prompt_audio_text is not None:
-                self._tts.cache_prompt_audio(
-                    prompt_audio_paths=prompt_audio_path,
-                    prompt_audio_texts=prompt_audio_text,
+                return self._tts.infer(
+                    spk_audio_path=spk_key,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    return_subtitles=return_subtitles,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    gpt_model=_SHARED_GPT_KEY,
+                    sovits_model=_SHARED_SOVITS_KEY,
                 )
-                pc = self._tts.prompt_audio_cache[prompt_audio_path]
-                prompt, phones1, bert1 = pc["prompt"], pc["phones1"], pc["bert1"]
-            elif w.prompt is not None:
-                prompt, phones1, bert1 = w.prompt, w.phones1, w.bert1
-            else:
-                raise ValueError(
-                    f"Speaker '{speaker}' has no cached prompt features. "
-                    "Provide prompt_audio_path + prompt_audio_text, "
-                    "or set them in SpeakerConfig."
-                )
-
-            ge = w.ge
-            t2s_model = self._shared_gpt.t2s_model
-            vq_model = self._shared_sovits.vq_model
-
-            # Text → phones + BERT
-            logger.info("Processing text to phones and BERT features...")
-            phones2, word2ph, bert2, norm_text = get_phones_and_bert(
-                text, self._tts.tts_config
-            )
-            all_phoneme_ids = (
-                torch.LongTensor(phones1 + phones2)
-                .to(self._tts.tts_config.device)
-                .unsqueeze(0)
-            )
-            bert = torch.cat([bert1, bert2]).unsqueeze(0)
-
-            # GPT inference
-            logger.info("Running GPT inference (Text-to-Semantic)...")
-            pred_semantic = t2s_model.infer(
-                all_phoneme_ids, prompt, bert,
-                top_k=top_k, top_p=top_p, temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
-
-            # SoVITS inference
-            logger.info("Running SoVITS inference (Semantic-to-Waveform)...")
-            phones2_tensor = (
-                torch.LongTensor(phones2)
-                .to(self._tts.tts_config.device)
-                .unsqueeze(0)
-            )
-            audio, attn = vq_model.decode(
-                pred_semantic, phones2_tensor, ge,
-                noise_scale=noise_scale, speed=speed,
-            )
-
-            # Post-processing (reuse TTS helpers)
-            audio = audio[0, 0, :]
-            assign = self._tts._viterbi_monotonic(attn)
-
-            if return_subtitles:
-                subtitles = self._tts._get_subtitles(word2ph, assign, speed)
-                if not self._tts._check_pause(subtitles[-1]["text"]):
-                    subtitles.append({
-                        "text": word2ph["word"][-1],
-                        "start_s": subtitles[-1]["end_s"],
-                        "end_s": subtitles[-1]["end_s"],
-                    })
-                subtitles[-1]["end_s"] += 0.2
-                subtitles = sub2text_index(subtitles, norm_text, text)
-            else:
-                subtitles = []
-
-            head_offset = self._tts._find_head_threshold_offsets(audio)
-            audio = audio[head_offset:]
-            if subtitles:
-                self._tts._increment_subtitle_times(
-                    subtitles, -head_offset / self.samplerate
-                )
-                subtitles[0]["start_s"] = max(0, subtitles[0]["start_s"])
-
-            audio = audio.float().cpu().numpy()
-            max_audio = np.abs(audio).max()
-            if max_audio > 1:
-                audio = audio / max_audio
-            audio = np.concatenate([
-                audio,
-                np.zeros((int(0.2 * self.samplerate),), dtype=audio.dtype),
-            ])
-
-            audio_len_s = len(audio) / self.samplerate
-            logger.info(f"[{speaker}] Complete. Generated {audio_len_s:.2f}s audio.")
-
-            return AudioClip(
-                self.audio_queue, audio, self.samplerate, audio_len_s, subtitles, text
-            )
 
     def infer_batched(
         self,
