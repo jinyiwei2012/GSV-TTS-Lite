@@ -3,7 +3,7 @@ from .TTS import (
     AudioClip,
     cut_text,
 )
-from .MultiSpeaker import MultiSpeakerTTS
+from .MultiSpeaker import MultiSpeakerTTS, ConfigMismatchError
 from .SpeakerWeights import SpeakerConfig, SpeakerWeights
 
 __all__ = [
@@ -13,4 +13,5 @@ __all__ = [
     "cut_text",
     "SpeakerConfig",
     "SpeakerWeights",
+    "ConfigMismatchError",
 ]

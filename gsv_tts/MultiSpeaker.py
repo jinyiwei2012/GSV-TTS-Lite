@@ -24,6 +24,8 @@ from .Loader import (
     extract_speaker_sovits_weights,
     load_shared_gpt,
     load_shared_sovits,
+    _load_gpt_state_dict,
+    _load_sovits_state_dict,
 )
 from .Player import AudioClip
 
@@ -32,6 +34,36 @@ logger = logging.getLogger(__name__)
 
 _SHARED_GPT_KEY = "__multi_speaker_shared_gpt__"
 _SHARED_SOVITS_KEY = "__multi_speaker_shared_sovits__"
+
+# Config keys that must match between base model and speaker models
+_GPT_CRITICAL_KEYS = [
+    ("model", "hidden_dim"),
+    ("model", "embedding_dim"),
+    ("model", "head"),
+    ("model", "n_layer"),
+    ("model", "vocab_size"),
+    ("model", "phoneme_vocab_size"),
+]
+
+_SOVITS_CRITICAL_KEYS = [
+    ("model", "gin_channels"),
+    ("model", "inter_channels"),
+    ("model", "hidden_channels"),
+    ("model", "filter_channels"),
+    ("model", "n_heads"),
+    ("model", "n_layers"),
+    ("model", "version"),
+]
+
+
+class ConfigMismatchError(ValueError):
+    """Raised when a speaker model config is incompatible with the base model.
+
+    All speakers must share identical GPT architecture (n_layer, model_dim,
+    vocab_size, etc.) and SoVITS architecture (gin_channels, version, etc.)
+    for weight injection via copy_() to be safe.
+    """
+    pass
 
 
 def _resolve_param(model: torch.nn.Module, param_path: str) -> torch.nn.Parameter:
@@ -130,6 +162,10 @@ class MultiSpeakerTTS:
         logger.info(f"Loading shared SoVITS backbone from: {base_sovits_path}")
         self._shared_sovits = load_shared_sovits(base_sovits_path, self._tts.tts_config)
 
+        # ── Store base configs for speaker compatibility validation ──
+        _, self._base_gpt_config = _load_gpt_state_dict(base_gpt_path)
+        _, self._base_sovits_hps = _load_sovits_state_dict(base_sovits_path)
+
         # ── Extract per-speaker weights ──
         self._speakers: dict[str, SpeakerWeights] = {}
         self._shared_gpt_layers = shared_gpt_layers  # store for logging
@@ -156,8 +192,45 @@ class MultiSpeakerTTS:
     # Speaker management
     # ==================================================================
 
+    def _validate_config(
+        self,
+        spk_name: str,
+        gpt_config: dict,
+        sovits_hps: dict,
+    ):
+        """Validate speaker configs against the base model.
+
+        Raises ConfigMismatchError if any critical architecture key differs.
+        """
+        # Validate GPT config
+        for section, key in _GPT_CRITICAL_KEYS:
+            base_val = self._base_gpt_config[section][key]
+            spk_val = gpt_config[section][key]
+            if base_val != spk_val:
+                raise ConfigMismatchError(
+                    f"Speaker '{spk_name}' GPT config mismatch: "
+                    f"{section}.{key}={spk_val}, base={base_val}"
+                )
+
+        # Validate SoVITS config
+        for section, key in _SOVITS_CRITICAL_KEYS:
+            base_val = self._base_sovits_hps[section][key]
+            spk_val = sovits_hps[section][key]
+            if base_val != spk_val:
+                raise ConfigMismatchError(
+                    f"Speaker '{spk_name}' SoVITS config mismatch: "
+                    f"{section}.{key}={spk_val}, base={base_val}"
+                )
+
+        logger.debug(f"Config validation passed for speaker '{spk_name}'")
+
     def _add_speaker(self, spk: SpeakerConfig):
         """Extract and cache speaker-specific weights and features."""
+        # ── Validate config compatibility before anything else ──
+        _, spk_gpt_config = _load_gpt_state_dict(spk.gpt_model_path)
+        _, spk_sovits_hps = _load_sovits_state_dict(spk.sovits_model_path)
+        self._validate_config(spk.name, spk_gpt_config, spk_sovits_hps)
+
         weights = SpeakerWeights(name=spk.name)
         weights.spk_audio_path = spk.spk_audio_path
         weights.prompt_audio_path = spk.prompt_audio_path or spk.spk_audio_path
