@@ -516,7 +516,9 @@ def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
 
     infer_duration = time.time() - start_time
     rtf = infer_duration / audio_len_s if audio_len_s > 0 else 0
-    msg = (f"✅ 多角色合成\n音频时长: {audio_len_s:.2f}s | "
+    spk_count = len(set(spk for spk, _ in tagged)) if tagged else 1
+    msg = (f"✅ 多角色合成 · {spk_count} 个角色\n"
+           f"音频时长: {audio_len_s:.2f}s | "
            f"推理耗时: {infer_duration:.2f}s | RTF: {rtf:.3f}")
 
     filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.wav"
@@ -554,29 +556,45 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             # ============ 多角色区域 ============
             with gr.Column(visible=False) as multi_model_col:
                 with gr.Group():
-                    gr.Markdown("### 多角色管理")
+                    gr.Markdown("### 多角色管理（每个角色的音色/风格参考在添加时单独配置）")
+
+                    # ── Add speaker form ──
                     with gr.Row():
-                        with gr.Column(scale=2):
-                            multi_name = gr.Textbox(label="角色名", placeholder="例如: alice")
-                            multi_gpt = gr.Textbox(label="GPT 模型路径 (.ckpt)", placeholder="models/alice_gpt.ckpt")
-                            multi_sovits = gr.Textbox(label="SoVITS 模型路径 (.pth)", placeholder="models/alice_sovits.pth")
-                        with gr.Column(scale=2):
-                            multi_spk_audio = gr.Audio(label="音色参考音频", type="filepath")
-                            multi_prompt_audio = gr.Audio(label="风格参考音频 (可选)", type="filepath")
-                            multi_prompt_text = gr.Textbox(label="风格参考文本 (可选)", placeholder="参考音频对应的文本")
+                        multi_name = gr.Textbox(label="角色名", placeholder="例如: alice", scale=1)
+                        multi_gpt = gr.Textbox(label="GPT 模型 (.ckpt)", placeholder="路径或留空扫描", scale=2)
+                        multi_sovits = gr.Textbox(label="SoVITS 模型 (.pth)", placeholder="路径或留空扫描", scale=2)
+
                     with gr.Row():
-                        multi_add_btn = gr.Button("➕ 添加角色", variant="secondary", scale=1)
-                        with gr.Column(scale=2):
-                            multi_cur_speaker = gr.Dropdown(label="当前发言角色", choices=[], interactive=True)
-                        multi_remove_name = gr.Dropdown(label="移除角色", choices=[], scale=1, interactive=True)
-                        multi_remove_btn = gr.Button("➖", variant="stop", scale=0)
-                    multi_table = gr.Dataframe(
-                        headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
-                        label="已加载角色",
-                        value=[],
-                        interactive=False,
-                    )
-                    multi_log = gr.Textbox(label="多角色状态", value="使用前请用默认模型初始化引擎", visible=True)
+                        multi_spk_audio = gr.Audio(label="音色参考音频", type="filepath", scale=2)
+                        multi_prompt_audio = gr.Audio(label="风格参考音频 (可选)", type="filepath", scale=2)
+                        with gr.Column(scale=1):
+                            multi_prompt_text = gr.Textbox(label="风格参考文本", placeholder="可选", lines=2)
+                            multi_add_btn = gr.Button("➕ 添加角色", variant="secondary", size="sm")
+
+                    # ── Speaker list + controls ──
+                    with gr.Row():
+                        multi_table = gr.Dataframe(
+                            headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
+                            label="已加载角色",
+                            value=[],
+                            interactive=False,
+                            scale=3,
+                        )
+                        with gr.Column(scale=1):
+                            multi_cur_speaker = gr.Dropdown(
+                                label="当前发言角色",
+                                choices=[],
+                                interactive=True,
+                                info="未使用 <speaker:> 标签时的默认角色",
+                            )
+                            multi_remove_name = gr.Dropdown(
+                                label="移除角色",
+                                choices=[],
+                                interactive=True,
+                            )
+                            multi_remove_btn = gr.Button("➖ 移除", variant="stop", size="sm")
+
+            # Remove old multi_log textbox - status goes to main log
 
             # ============ 文本输入（共享） ============
             with gr.Row():
@@ -603,7 +621,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                         cut_mute = gr.Number(label="切分静音时长(s)", value=0.3)
                         cut_mute_scale_map = gr.Textbox(label="标点静音缩放映射", value='{"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8}')
 
-                with gr.Column(scale=1):
+                with gr.Column(scale=1, visible=True) as ref_audio_col:
                     gr.Markdown("### 第三步：风格与音色参考")
                     with gr.Row():
                         preset_dropdown = gr.Dropdown(choices=get_preset_names(), label="加载预设", scale=2)
@@ -671,18 +689,19 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         return None
 
     def toggle_mode(mode):
-        """Show/hide single-model vs multi-speaker sections."""
+        """Show/hide sections based on mode."""
         is_single = mode == "单模型"
         return (
-            gr.update(visible=is_single),   # single_model_col
-            gr.update(visible=not is_single),  # multi_model_col
+            gr.update(visible=is_single),    # single_model_col
+            gr.update(visible=not is_single), # multi_model_col
+            gr.update(visible=is_single),    # ref_audio_col
         )
 
     # ── Mode toggle ──
     tts_mode.change(
         fn=toggle_mode,
         inputs=[tts_mode],
-        outputs=[single_model_col, multi_model_col],
+        outputs=[single_model_col, multi_model_col, ref_audio_col],
     )
 
     save_btn.click(
@@ -791,7 +810,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         fn=multi_add_speaker,
         inputs=[multi_name, multi_gpt, multi_sovits,
                 multi_spk_audio, multi_prompt_audio, multi_prompt_text],
-        outputs=[multi_table, multi_log],
+        outputs=[multi_table, log_output],
     ).then(
         fn=_refresh_multi_ui,
         inputs=[],
@@ -801,7 +820,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     multi_remove_btn.click(
         fn=multi_remove_speaker,
         inputs=[multi_remove_name],
-        outputs=[multi_table, multi_log],
+        outputs=[multi_table, log_output],
     ).then(
         fn=_refresh_multi_ui,
         inputs=[],
