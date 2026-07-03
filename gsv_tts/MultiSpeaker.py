@@ -497,50 +497,119 @@ class MultiSpeakerTTS:
         bert_batch_size: int = 20,
         sovits_batch_size: int = 10,
     ) -> list[AudioClip]:
-        """Batch inference — all items use the current active speaker's weights.
+        """Batch inference with true GPU parallelism per speaker.
 
-        Note: Currently all items in one batch must use the SAME speaker.
-        Multi-speaker batches (mixing speakers) are not yet supported
-        due to the sequential nature of weight injection.
+        Groups texts by speaker, then delegates to TTS.infer_batched() for
+        each speaker group. Same-speaker texts share one weight injection
+        and one GPU batch — orders of magnitude faster than per-text calls.
+
+        Multi-speaker batches are supported: texts are grouped by speaker
+        and each group is processed as an independent batch.
 
         Args:
             speaker_texts: List of (speaker_name, text) tuples.
-            ... (other args same as infer())
+            prompt_audio_paths: Optional external prompt audio override.
+                If provided, falls back to per-text sequential inference.
+            prompt_audio_texts: Optional external prompt transcription override.
+            ... (other args, passed through to TTS.infer_batched)
 
         Returns:
-            List of AudioClip results.
+            List of AudioClip results in the same order as speaker_texts.
         """
-        # Validate all texts use the same speaker
-        speakers_seen = set(s for s, _ in speaker_texts)
-        if len(speakers_seen) > 1:
-            logger.warning(
-                "infer_batched received multiple speakers. "
-                "Processing sequentially grouped by speaker."
+        if not speaker_texts:
+            return []
+
+        has_external_prompts = (
+            prompt_audio_paths is not None or prompt_audio_texts is not None
+        )
+
+        # ── Group by speaker (preserving original order) ──
+        groups: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for orig_idx, (speaker, text) in enumerate(speaker_texts):
+            groups[speaker].append((orig_idx, text))
+
+        all_results: list[AudioClip | None] = [None] * len(speaker_texts)
+
+        if len(groups) > 1:
+            logger.info(
+                f"infer_batched: {len(speaker_texts)} texts across "
+                f"{len(groups)} speakers — batching per speaker group"
             )
 
-        results = []
-        for speaker, text in speaker_texts:
-            result = self.infer(
-                speaker=speaker,
-                text=text,
-                prompt_audio_path=(
-                    prompt_audio_paths if isinstance(prompt_audio_paths, str)
-                    else prompt_audio_paths[speaker_texts.index((speaker, text))]
-                    if isinstance(prompt_audio_paths, list) else None
-                ),
-                prompt_audio_text=(
-                    prompt_audio_texts if isinstance(prompt_audio_texts, str)
-                    else prompt_audio_texts[speaker_texts.index((speaker, text))]
-                    if isinstance(prompt_audio_texts, list) else None
-                ),
-                return_subtitles=return_subtitles,
-                top_k=top_k, top_p=top_p, temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                noise_scale=noise_scale, speed=speed,
-            )
-            results.append(result)
+        with self._tts._infer_lock:
+            for speaker, items in groups.items():
+                orig_indices = [idx for idx, _ in items]
+                texts = [text for _, text in items]
 
-        return results
+                if has_external_prompts:
+                    # External prompt override → per-text fallback
+                    for i, orig_idx in enumerate(orig_indices):
+                        pp = (
+                            prompt_audio_paths
+                            if isinstance(prompt_audio_paths, str)
+                            else prompt_audio_paths[orig_idx]
+                            if isinstance(prompt_audio_paths, list)
+                            else None
+                        )
+                        pt = (
+                            prompt_audio_texts
+                            if isinstance(prompt_audio_texts, str)
+                            else prompt_audio_texts[orig_idx]
+                            if isinstance(prompt_audio_texts, list)
+                            else None
+                        )
+                        all_results[orig_idx] = self.infer(
+                            speaker=speaker,
+                            text=texts[i],
+                            prompt_audio_path=pp,
+                            prompt_audio_text=pt,
+                            return_subtitles=return_subtitles,
+                            top_k=top_k, top_p=top_p, temperature=temperature,
+                            repetition_penalty=repetition_penalty,
+                            noise_scale=noise_scale, speed=speed,
+                        )
+                else:
+                    # Use cached prompt → true GPU batch
+                    self._require_speaker(speaker)
+                    with self._activate_shared_models(speaker) as (
+                        spk_key,
+                        prompt_key,
+                        prompt_text,
+                    ):
+                        if prompt_key is None:
+                            # Speaker has no cached prompt — fall back
+                            logger.warning(
+                                f"Speaker '{speaker}' has no cached prompt, "
+                                "falling back to per-text inference."
+                            )
+                            for i, orig_idx in enumerate(orig_indices):
+                                all_results[orig_idx] = self.infer(
+                                    speaker=speaker,
+                                    text=texts[i],
+                                    return_subtitles=return_subtitles,
+                                    top_k=top_k, top_p=top_p, temperature=temperature,
+                                    repetition_penalty=repetition_penalty,
+                                    noise_scale=noise_scale, speed=speed,
+                                )
+                        else:
+                            audios = self._tts.infer_batched(
+                                spk_audio_paths=spk_key,
+                                prompt_audio_paths=prompt_key,
+                                prompt_audio_texts=prompt_text,
+                                texts=texts,
+                                return_subtitles=return_subtitles,
+                                top_k=top_k, top_p=top_p, temperature=temperature,
+                                repetition_penalty=repetition_penalty,
+                                noise_scale=noise_scale, speed=speed,
+                                bert_batch_size=bert_batch_size,
+                                sovits_batch_size=sovits_batch_size,
+                                gpt_model=_SHARED_GPT_KEY,
+                                sovits_model=_SHARED_SOVITS_KEY,
+                            )
+                            for orig_idx, audio in zip(orig_indices, audios):
+                                all_results[orig_idx] = audio
+
+        return all_results  # type: ignore[return-value]
 
     def infer_stream(
         self,
