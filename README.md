@@ -292,8 +292,64 @@ similarity = tts.verify_speaker("examples\laffey.mp3", "examples\AnAn.ogg")
 print("声纹相似度：", similarity)
 ```
 
+#### 6. 多角色推理 (Multi-Speaker) 🆕
+
+`MultiSpeakerTTS` 支持在同一会话中加载多个微调角色，共享 GPT + SoVITS 模型骨干，每个角色仅需注入 ~5-15% 的轻量专属权重。
+
+```python
+from gsv_tts import MultiSpeakerTTS, SpeakerConfig
+
+# 定义多个角色
+speakers = [
+    SpeakerConfig(
+        name="alice",
+        gpt_model_path="models/alice_gpt.ckpt",
+        sovits_model_path="models/alice_sovits.pth",
+        spk_audio_path="audio/alice_ref.wav",
+        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_text="こんにちは、アリスです。",
+    ),
+    SpeakerConfig(
+        name="bob",
+        gpt_model_path="models/bob_gpt.ckpt",
+        sovits_model_path="models/bob_sovits.pth",
+        spk_audio_path="audio/bob_ref.wav",
+        prompt_audio_path="audio/bob_prompt.ogg",
+        prompt_audio_text="こんにちは、ボブです。",
+    ),
+]
+
+# 一次性加载所有角色（共享骨干 + 角色专属权重）
+tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
+
+# 单角色推理——根据角色名自动路由
+audio = tts.infer("alice", "今日も頑張りましょう！")
+audio.play()
+
+# 批量推理——相同角色自动 GPU 并行
+audios = tts.infer_batched([
+    ("alice", "こんにちは"),
+    ("alice", "お元気ですか"),
+    ("bob",   "よろしくお願いします"),
+])
+
+# 运行时管理
+tts.add_speaker(SpeakerConfig(name="charlie", ...))
+tts.remove_speaker("bob")
+print(tts.speaker_names)  # ["alice", "charlie"]
+```
+
+> [!TIP]
+> **自动兼容性校验**：加载时自动比对角色模型与基模型的架构参数（`vocab_size`、`n_layer`、`gin_channels`、`upsample_initial_channel` 等）。不兼容的角色会**自动降级**为完整模型加载，无需用户干预。
+
+| 方案 | 1 角色 | 3 角色 | 5 角色 | 10 角色 |
+|------|--------|--------|--------|---------|
+| 全量加载 | ~800MB | ~2.4GB | ~4.0GB | ~8.0GB |
+| **MultiSpeakerTTS** | ~800MB | **~1.2GB** | **~1.4GB** | **~2.0GB** |
+| 显存节省 | — | **51%** | **65%** | **75%** |
+
 <details>
-<summary><strong>6. 其他函数接口</strong></summary>
+<summary><strong>7. 其他函数接口</strong></summary>
 
 ### 1. 模型管理
 
