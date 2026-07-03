@@ -46,6 +46,15 @@ class SpeakerWeights:
     name: str
     """Speaker name matching SpeakerConfig.name."""
 
+    spk_audio_path: str | None = None
+    """Original speaker reference audio path used to pre-compute ge."""
+
+    prompt_audio_path: str | None = None
+    """Original prompt audio path used to pre-compute prompt features."""
+
+    prompt_audio_text: str | None = None
+    """Original prompt transcription used to pre-compute prompt features."""
+
     # ── GPT speaker-specific weights ──
 
     gpt_weights: dict[str, torch.Tensor] = field(default_factory=dict)

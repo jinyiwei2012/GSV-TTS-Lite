@@ -186,7 +186,15 @@ _SOVITS_SPEAKER_PREFIXES = [
     "sv_emb.",
     "ge_to512.",
     "prelu.",
+    "dec.cond.",
 ]
+
+
+def _is_sovits_speaker_weight(key: str) -> bool:
+    """Return whether a SoVITS state key belongs to per-speaker conditioning."""
+    if any(key.startswith(prefix) for prefix in _SOVITS_SPEAKER_PREFIXES):
+        return True
+    return key.startswith("flow.") and ".enc.cond_layer." in key
 
 
 def _load_gpt_state_dict(gpt_path: str) -> tuple[dict[str, torch.Tensor], dict]:
@@ -324,6 +332,8 @@ def extract_speaker_sovits_weights(
       - sv_emb.*             (SV embedding projection, v2Pro+ only)
       - ge_to512.*           (ge dimension adapter, v2Pro+ only)
       - prelu.*              (post-fusion activation, v2Pro+ only)
+      - flow.*.enc.cond_layer.* (WN conditioning projections)
+      - dec.cond.*           (vocoder conditioning projection)
 
     Args:
         sovits_path: Path to the SoVITS checkpoint (.pth file or safetensors directory).
@@ -337,10 +347,8 @@ def extract_speaker_sovits_weights(
     speaker_weights = {}
 
     for key, tensor in state_dict.items():
-        for prefix in _SOVITS_SPEAKER_PREFIXES:
-            if key.startswith(prefix):
-                speaker_weights[key] = tensor.cpu()
-                break
+        if _is_sovits_speaker_weight(key):
+            speaker_weights[key] = tensor.cpu()
 
     return speaker_weights
 
@@ -413,7 +421,8 @@ def load_shared_sovits(
 ) -> Sovits:
     """Load SoVITS model as a shared backbone — speaker-specific layers are randomly initialized.
 
-    Speaker-specific layers (ref_enc, sv_emb, ge_to512, prelu) are set to random.
+    Speaker-specific layers (ref_enc, sv_emb, ge_to512, prelu, flow cond,
+    decoder cond) are set to random.
     These will be overwritten via copy_() at inference time with speaker-specific
     weights from extract_speaker_sovits_weights().
 
@@ -435,10 +444,8 @@ def load_shared_sovits(
 
     # Randomize speaker-specific layers
     for key in list(state_dict.keys()):
-        for prefix in _SOVITS_SPEAKER_PREFIXES:
-            if key.startswith(prefix):
-                state_dict[key] = torch.empty_like(state_dict[key]).normal_()
-                break
+        if _is_sovits_speaker_weight(key):
+            state_dict[key] = torch.empty_like(state_dict[key]).normal_()
 
     # Build model and load (partially randomized) state_dict
     vq_model = SynthesizerTrn(
