@@ -241,46 +241,23 @@ def load_preset(name):
 multi_tts: MultiSpeakerTTS | None = None
 _speaker_data: list[dict] = []  # [{name, gpt_path, sovits_path, spk_audio, prompt_audio, prompt_text, mode}]
 
-MULTI_SPK_TEXT_HELP = """支持多角色混用，格式：
-<speaker:角色名>该角色说的文本</speaker:角色名>
 
-示例：
-<speaker:alice>こんにちは、アリスです。</speaker:alice>
-<speaker:bob>よろしくお願いします。</speaker:bob>
-普通文本（使用当前选中角色）"""
-
-
-def multi_init_engine(
-    base_gpt_path, base_sovits_path,
-    use_bert, use_flash_attn,
-    models_dir,
-):
-    """初始化 MultiSpeakerTTS 引擎"""
-    global multi_tts, _speaker_data
-    try:
-        kwargs = {"use_bert": use_bert, "use_flash_attn": use_flash_attn}
-        if models_dir:
-            kwargs["models_dir"] = models_dir
-        if base_gpt_path:
-            kwargs["base_gpt_path"] = base_gpt_path
-        if base_sovits_path:
-            kwargs["base_sovits_path"] = base_sovits_path
-
-        multi_tts = MultiSpeakerTTS(speakers=[], **kwargs)
-        _speaker_data = []
-        return _render_speaker_table(), "✅ 多角色引擎已初始化"
-    except Exception as e:
-        return _render_speaker_table(), f"❌ 初始化失败: {e}"
+def _render_speaker_table():
+    """Render speaker list table - returns data directly for Gradio 6.x"""
+    if not _speaker_data:
+        return []
+    return [
+        [s["name"], Path(s["gpt_path"]).name, Path(s["sovits_path"]).name, s["mode"]]
+        for s in _speaker_data
+    ]
 
 
 def multi_add_speaker(
     name, gpt_path, sovits_path,
     spk_audio, prompt_audio, prompt_text,
 ):
-    """添加一个角色到 MultiSpeakerTTS"""
+    """Add a speaker to MultiSpeakerTTS (auto-initializes if needed)."""
     global multi_tts, _speaker_data
-    if multi_tts is None:
-        return _render_speaker_table(), "❌ 请先初始化多角色引擎"
     if not name:
         return _render_speaker_table(), "❌ 请输入角色名"
     if not gpt_path or not sovits_path:
@@ -289,6 +266,10 @@ def multi_add_speaker(
         return _render_speaker_table(), "❌ 请上传音色参考音频"
 
     try:
+        # Auto-initialize if not yet initialized
+        if multi_tts is None:
+            multi_tts = MultiSpeakerTTS(speakers=[], use_bert=True)
+
         spk = SpeakerConfig(
             name=name,
             gpt_model_path=gpt_path,
@@ -301,13 +282,9 @@ def multi_add_speaker(
         w = multi_tts._speakers[name]
         mode = "🔄 完整模型" if w.is_full_model else "✅ 共享骨干"
         _speaker_data.append({
-            "name": name,
-            "gpt_path": gpt_path,
-            "sovits_path": sovits_path,
-            "spk_audio": spk_audio,
-            "prompt_audio": prompt_audio,
-            "prompt_text": prompt_text,
-            "mode": mode,
+            "name": name, "gpt_path": gpt_path, "sovits_path": sovits_path,
+            "spk_audio": spk_audio, "prompt_audio": prompt_audio,
+            "prompt_text": prompt_text, "mode": mode,
         })
         return _render_speaker_table(), f"✅ 角色 '{name}' 已添加 ({mode})"
     except Exception as e:
@@ -315,12 +292,12 @@ def multi_add_speaker(
 
 
 def multi_remove_speaker(name):
-    """移除一个角色"""
+    """Remove a speaker."""
     global multi_tts, _speaker_data
-    if multi_tts is None:
-        return _render_speaker_table(), "❌ 请先初始化多角色引擎"
     if not name:
         return _render_speaker_table(), "❌ 请选择要移除的角色"
+    if multi_tts is None:
+        return _render_speaker_table(), "❌ 引擎未初始化"
 
     try:
         multi_tts.remove_speaker(name)
@@ -347,100 +324,6 @@ def _get_speaker_choices():
 def _get_remove_choices():
     names = [s["name"] for s in _speaker_data]
     return gr.update(choices=names)
-
-
-def multi_infer(
-    speaker, text,
-    top_k, top_p, temperature, rep_penalty, noise_scale, speed,
-    enable_enhance,
-):
-    """多角色推理——支持 <speaker:name> 标签混用"""
-    global multi_tts
-    if multi_tts is None:
-        return None, "❌ 请先初始化多角色引擎"
-
-    try:
-        start_time = time.time()
-
-        # 解析 <speaker:name>text</speaker:name> 标签
-        tagged = re.findall(r'<speaker:([^>]+)>(.*?)</speaker>', text, re.DOTALL)
-
-        if tagged:
-            # 多角色批量推理
-            speaker_texts = [(spk.strip(), t.strip()) for spk, t in tagged]
-            # 处理标签外的普通文本
-            remaining = re.sub(r'<speaker:[^>]+>.*?</speaker>', '', text, flags=re.DOTALL).strip()
-            if remaining and speaker:
-                # 将未标记文本作为选中角色的内容，插入到合适位置
-                parts = re.split(r'(<speaker:[^>]+>.*?</speaker>)', text)
-                for part in parts:
-                    part = part.strip()
-                    if not part:
-                        continue
-                    m = re.match(r'<speaker:([^>]+)>(.*?)</speaker>', part)
-                    if m:
-                        speaker_texts.append((m.group(1).strip(), m.group(2).strip()))
-                    else:
-                        speaker_texts.append((speaker, part))
-
-            # 去重排序
-            seen = set()
-            ordered = []
-            for st in speaker_texts:
-                key = (st[0], st[1])
-                if key not in seen:
-                    seen.add(key)
-                    ordered.append(st)
-
-            audios = multi_tts.infer_batched(
-                ordered,
-                top_k=top_k, top_p=top_p, temperature=temperature,
-                repetition_penalty=rep_penalty,
-                noise_scale=noise_scale, speed=speed,
-            )
-
-            samplerate = audios[0].samplerate
-            audio_data = np.concatenate([a.audio_data for a in audios])
-            audio_len_s = sum(a.audio_len_s for a in audios)
-        else:
-            # 单角色推理
-            audio = multi_tts.infer(
-                speaker=speaker,
-                text=text,
-                top_k=top_k, top_p=top_p, temperature=temperature,
-                repetition_penalty=rep_penalty,
-                noise_scale=noise_scale, speed=speed,
-            )
-            samplerate = audio.samplerate
-            audio_data = audio.audio_data
-            audio_len_s = audio.audio_len_s
-
-        if enable_enhance:
-            audio_data = enhance_audio(audio_data, samplerate)
-
-        end_time = time.time()
-        infer_duration = end_time - start_time
-        rtf = infer_duration / audio_len_s if audio_len_s > 0 else 0
-
-        msg = (
-            f"✅ 成功！\n"
-            f"音频时长: {audio_len_s:.2f}s | "
-            f"推理耗时: {infer_duration:.2f}s | "
-            f"RTF: {rtf:.3f}"
-        )
-
-        # Save to history
-        filename = f"multi_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.wav"
-        save_path = HISTORY_DIR / filename
-        import soundfile as sf
-        sf.write(str(save_path), audio_data, samplerate)
-
-        return (samplerate, audio_data), msg
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return None, f"❌ 异常: {e}"
 
 
 def vc_request(
@@ -481,15 +364,23 @@ def tts_request(
     enable_enhance,
     is_cut_text, cut_minlen, cut_mute, cut_mute_scale_map,
     sovits_batch_size,
+    mode, multi_cur_speaker,
 ):
+    """Unified TTS inference — routes to single-model or multi-speaker engine."""
     try:
         start_time = time.time()
 
+        if mode == "多角色" and multi_tts is not None:
+            # ── Multi-speaker mode ──
+            return _tts_multi_infer(
+                multi_cur_speaker, text,
+                top_k, top_p, temperature, rep_penalty, noise_scale, speed,
+                enable_enhance, start_time,
+            )
+
+        # ── Single-model mode (original logic) ──
         spk_audio = parse_speaker_weights(multi_spk_files, spk_weights)
-
-        #cut_punds = set(cut_punds)
         cut_mute_scale_map = json.loads(cut_mute_scale_map)
-
         cut_texts, tags = parse_tagged_text(text)
 
         orig_idx = []
@@ -506,7 +397,6 @@ def tts_request(
                 tags[i] = 'break'
             else:
                 orig_idx.append(i)
-
                 if tags[i] is None or tags[i] not in preset_names:
                     spk_audio_paths.append(spk_audio)
                     prompt_audio_paths.append(prompt_audio)
@@ -516,16 +406,14 @@ def tts_request(
                     spk_audio_paths.append(parse_speaker_weights(p["multi_spk_files"], p["spk_weights"]))
                     prompt_audio_paths.append(p["prompt_audio"])
                     prompt_audio_texts.append(p["prompt_text"])
-                
                 texts.append(cut_texts[i])
-                    
+
         audios = tts.infer_batched(
             spk_audio_paths=spk_audio_paths,
             prompt_audio_paths=prompt_audio_paths,
             prompt_audio_texts=prompt_audio_texts,
             texts=texts,
             is_cut_text=is_cut_text,
-            #cut_punds=cut_punds,
             cut_minlen=cut_minlen,
             cut_mute=cut_mute,
             cut_mute_scale_map=cut_mute_scale_map,
@@ -539,7 +427,6 @@ def tts_request(
         )
 
         samplerate = audios[0].samplerate
-
         audio_data = []
         audio_len_s = 0
         for i in range(len(cut_texts)):
@@ -550,16 +437,14 @@ def tts_request(
                 tmp_audio = audios[orig_idx.index(i)]
                 audio_data.append(tmp_audio.audio_data)
                 audio_len_s += tmp_audio.audio_len_s
-        
+
         audio_data = np.concatenate(audio_data)
-        
         audio = AudioClip(None, audio_data, samplerate, audio_len_s, None, None)
-        
-        end_time = time.time()
-        
+
         if enable_enhance:
             audio.audio_data = enhance_audio(audio.audio_data, audio.samplerate)
 
+        end_time = time.time()
         infer_duration = end_time - start_time
         rtf = infer_duration / audio.audio_len_s
 
@@ -576,11 +461,71 @@ def tts_request(
         history_entry = [datetime.now().strftime("%H:%M:%S"), text[:20] + "...", str(save_path)]
 
         return (audio.samplerate, audio.audio_data), msg, history_entry
-    
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         return None, f"异常: {str(e)}", None
+
+
+def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
+                     noise_scale, speed, enable_enhance, start_time):
+    """Multi-speaker inference backend (called from tts_request)."""
+    # Parse <speaker:name> tags for multi-speaker mixing
+    tagged = re.findall(r'<speaker:([^>]+)>(.*?)</speaker>', text, re.DOTALL)
+
+    if tagged:
+        speaker_texts = [(spk.strip(), t.strip()) for spk, t in tagged]
+        remaining = re.sub(r'<speaker:[^>]+>.*?</speaker>', '', text, flags=re.DOTALL).strip()
+        if remaining and speaker:
+            parts = re.split(r'(<speaker:[^>]+>.*?</speaker>)', text)
+            for part in parts:
+                part = part.strip()
+                if not part: continue
+                m = re.match(r'<speaker:([^>]+)>(.*?)</speaker>', part)
+                if m:
+                    speaker_texts.append((m.group(1).strip(), m.group(2).strip()))
+                else:
+                    speaker_texts.append((speaker, part))
+        seen = set()
+        ordered = []
+        for st in speaker_texts:
+            key = (st[0], st[1])
+            if key not in seen:
+                seen.add(key)
+                ordered.append(st)
+
+        audios = multi_tts.infer_batched(ordered, top_k=top_k, top_p=top_p,
+                                         temperature=temperature,
+                                         repetition_penalty=rep_penalty,
+                                         noise_scale=noise_scale, speed=speed)
+        samplerate = audios[0].samplerate
+        audio_data = np.concatenate([a.audio_data for a in audios])
+        audio_len_s = sum(a.audio_len_s for a in audios)
+    else:
+        audio = multi_tts.infer(speaker=speaker, text=text, top_k=top_k, top_p=top_p,
+                                temperature=temperature,
+                                repetition_penalty=rep_penalty,
+                                noise_scale=noise_scale, speed=speed)
+        samplerate = audio.samplerate
+        audio_data = audio.audio_data
+        audio_len_s = audio.audio_len_s
+
+    if enable_enhance:
+        audio_data = enhance_audio(audio_data, samplerate)
+
+    infer_duration = time.time() - start_time
+    rtf = infer_duration / audio_len_s if audio_len_s > 0 else 0
+    msg = (f"✅ 多角色合成\n音频时长: {audio_len_s:.2f}s | "
+           f"推理耗时: {infer_duration:.2f}s | RTF: {rtf:.3f}")
+
+    filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.wav"
+    save_path = HISTORY_DIR / filename
+    import soundfile as sf
+    sf.write(str(save_path), audio_data, samplerate)
+    history_entry = [datetime.now().strftime("%H:%M:%S"), text[:20] + "...", str(save_path)]
+
+    return (samplerate, audio_data), msg, history_entry
 
 
 # --- UI 界面 ---
@@ -591,17 +536,58 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         with gr.TabItem("文本转语音 (TTS)"):
 
             history_state = gr.State([])
+            tts_mode = gr.Radio(
+                choices=["单模型", "多角色"],
+                value="单模型",
+                label="推理模式",
+                interactive=True,
+            )
 
-            with gr.Group():
-                gr.Markdown("### 第一步：加载模型文件(可手动填写路径，留空使用默认模型)")
-                with gr.Row():
-                    gpt_path = gr.Dropdown(label="1. GPT 模型路径 (.ckpt)", choices=[''], value='', allow_custom_value=True, scale=1)
-                    sovits_path = gr.Dropdown(label="2. SoVITS 模型路径 (.pth)", choices=[''], value='', allow_custom_value=True, scale=1)
+            # ============ 单模型区域 ============
+            with gr.Column(visible=True) as single_model_col:
+                with gr.Group():
+                    gr.Markdown("### 第一步：加载模型文件(可手动填写路径，留空使用默认模型)")
+                    with gr.Row():
+                        gpt_path = gr.Dropdown(label="GPT 模型路径 (.ckpt)", choices=[''], value='', allow_custom_value=True, scale=1)
+                        sovits_path = gr.Dropdown(label="SoVITS 模型路径 (.pth)", choices=[''], value='', allow_custom_value=True, scale=1)
 
+            # ============ 多角色区域 ============
+            with gr.Column(visible=False) as multi_model_col:
+                with gr.Group():
+                    gr.Markdown("### 多角色管理")
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            multi_name = gr.Textbox(label="角色名", placeholder="例如: alice")
+                            multi_gpt = gr.Textbox(label="GPT 模型路径 (.ckpt)", placeholder="models/alice_gpt.ckpt")
+                            multi_sovits = gr.Textbox(label="SoVITS 模型路径 (.pth)", placeholder="models/alice_sovits.pth")
+                        with gr.Column(scale=2):
+                            multi_spk_audio = gr.Audio(label="音色参考音频", type="filepath")
+                            multi_prompt_audio = gr.Audio(label="风格参考音频 (可选)", type="filepath")
+                            multi_prompt_text = gr.Textbox(label="风格参考文本 (可选)", placeholder="参考音频对应的文本")
+                    with gr.Row():
+                        multi_add_btn = gr.Button("➕ 添加角色", variant="secondary", scale=1)
+                        with gr.Column(scale=2):
+                            multi_cur_speaker = gr.Dropdown(label="当前发言角色", choices=[], interactive=True)
+                        multi_remove_name = gr.Dropdown(label="移除角色", choices=[], scale=1, interactive=True)
+                        multi_remove_btn = gr.Button("➖", variant="stop", scale=0)
+                    multi_table = gr.Dataframe(
+                        headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
+                        label="已加载角色",
+                        value=[],
+                        interactive=False,
+                    )
+                    multi_log = gr.Textbox(label="多角色状态", value="使用前请用默认模型初始化引擎", visible=True)
+
+            # ============ 文本输入（共享） ============
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### 第二步：合成内容（支持多说话人，支持停顿标签）")
-                    text = gr.Textbox(label="合成目标文本", lines=5, value="谁罕见?啊？骂谁罕见！")
+                    gr.Markdown("### 第二步：合成内容")
+                    text = gr.Textbox(
+                        label="合成目标文本",
+                        lines=5,
+                        value="谁罕见?啊？骂谁罕见！",
+                        info="多角色模式支持 <speaker:角色名>文本</speaker:角色名> 标签",
+                    )
                     enable_enhance = gr.Checkbox(label="启用音频增强", value=False)
 
                     with gr.Accordion("生成参数", open=False):
@@ -613,14 +599,12 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                         rep_penalty = gr.Slider(1.0, 2.0, 1.35, label="重复惩罚")
                         sovits_batch_size = gr.Number(label="SoVITS最大并行推理大小", value=10)
                         is_cut_text = gr.Checkbox(label="是否切分文本", value=True)
-                        # cut_punds = gr.Textbox(label="切分标点", value='{"。", ".", "?", "？", "!", "！", ",", "，", ":", "：", ";", "；", "、"}')
                         cut_minlen = gr.Number(label="最小切分长度", value=10)
                         cut_mute = gr.Number(label="切分静音时长(s)", value=0.3)
                         cut_mute_scale_map = gr.Textbox(label="标点静音缩放映射", value='{"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8}')
 
                 with gr.Column(scale=1):
                     gr.Markdown("### 第三步：风格与音色参考")
-
                     with gr.Row():
                         preset_dropdown = gr.Dropdown(choices=get_preset_names(), label="加载预设", scale=2)
                         preset_name = gr.Textbox(label="预设名称", placeholder="保存当前设置为...", scale=2)
@@ -634,6 +618,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                         multi_spk_files = gr.File(label="可上传多个音色参考音频", file_count="multiple")
                         spk_weights = gr.Textbox(label="音色权重 (用冒号分隔)", value="1.0", placeholder="例如: 1.0: 1.0")
 
+            # ============ 推理输出（共享） ============
             with gr.Group():
                 btn = gr.Button("🔥 开始语音合成", variant="primary", size="lg")
                 with gr.Row():
@@ -670,129 +655,6 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                     vc_output_audio = gr.Audio(label="音色迁移结果", interactive=False)
                     vc_log_output = gr.Textbox(label="处理日志", lines=5)
 
-        with gr.TabItem("多角色推理 (Multi-Speaker) 🆕"):
-            gr.Markdown("### 加载多个微调角色，共享模型骨干，显存节省 50-75%")
-
-            with gr.Group():
-                gr.Markdown("#### 第一步：初始化引擎")
-                with gr.Row():
-                    multi_models_dir = gr.Textbox(label="模型目录 (留空使用默认)", value="", scale=1)
-                    multi_base_gpt = gr.Textbox(label="基 GPT 模型 (留空使用默认 s1v3.ckpt)", value="", scale=1)
-                    multi_base_sovits = gr.Textbox(label="基 SoVITS 模型 (留空使用默认)", value="", scale=1)
-                with gr.Row():
-                    multi_use_bert = gr.Checkbox(label="启用 BERT", value=True)
-                    multi_use_flash = gr.Checkbox(label="启用 Flash Attn (需安装)", value=False)
-                    multi_init_btn = gr.Button("🚀 初始化多角色引擎", variant="primary")
-                    multi_log = gr.Textbox(label="状态", value="尚未初始化", scale=3)
-
-            with gr.Group():
-                gr.Markdown("#### 第二步：管理角色")
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        multi_name = gr.Textbox(label="角色名", placeholder="例如: alice")
-                        multi_gpt = gr.Textbox(label="GPT 模型路径 (.ckpt)", placeholder="models/alice_gpt.ckpt")
-                        multi_sovits = gr.Textbox(label="SoVITS 模型路径 (.pth)", placeholder="models/alice_sovits.pth")
-                    with gr.Column(scale=2):
-                        multi_spk_audio = gr.Audio(label="音色参考音频", type="filepath")
-                        multi_prompt_audio = gr.Audio(label="风格参考音频 (可选)", type="filepath")
-                        multi_prompt_text = gr.Textbox(label="风格参考文本 (可选)", placeholder="参考音频对应的文本")
-
-                with gr.Row():
-                    multi_add_btn = gr.Button("➕ 添加角色", variant="secondary")
-                    multi_remove_name = gr.Dropdown(label="选择要移除的角色", choices=[], scale=2, interactive=True)
-                    multi_remove_btn = gr.Button("➖ 移除角色", variant="stop", scale=1)
-
-                multi_table = gr.Dataframe(
-                    headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
-                    label="已加载角色",
-                    value=[],
-                    interactive=False,
-                )
-
-            with gr.Group():
-                gr.Markdown("#### 第三步：推理")
-                multi_cur_speaker = gr.Dropdown(
-                    label="当前发言角色 (未使用 <speaker:> 标签时的默认角色)",
-                    choices=[],
-                    interactive=True,
-                )
-                multi_text = gr.Textbox(
-                    label="合成目标文本",
-                    lines=5,
-                    value="こんにちは。",
-                    info=MULTI_SPK_TEXT_HELP,
-                )
-                with gr.Row():
-                    multi_enable_enhance = gr.Checkbox(label="启用音频增强", value=False)
-
-                with gr.Accordion("生成参数", open=False):
-                    multi_speed = gr.Slider(0.5, 2.0, 1.0, step=0.1, label="语速")
-                    multi_noise_scale = gr.Slider(0.1, 1.0, 0.5, step=0.05, label="噪声比例")
-                    multi_temperature = gr.Slider(0.1, 1.5, 1.0, label="温度")
-                    multi_top_k = gr.Slider(1, 50, 15, step=1, label="Top K")
-                    multi_top_p = gr.Slider(0.1, 1.0, 1.0, label="Top P")
-                    multi_rep_penalty = gr.Slider(1.0, 2.0, 1.35, label="重复惩罚")
-
-            with gr.Group():
-                multi_btn = gr.Button("🔥 开始合成", variant="primary", size="lg")
-                multi_output_audio = gr.Audio(label="生成的音频结果")
-                multi_output_log = gr.Textbox(label="系统状态信息")
-
-            # ── Multi-Speaker event bindings ──
-            multi_init_btn.click(
-                fn=multi_init_engine,
-                inputs=[
-                    multi_base_gpt, multi_base_sovits,
-                    multi_use_bert, multi_use_flash,
-                    multi_models_dir,
-                ],
-                outputs=[multi_table, multi_log],
-            ).then(
-                fn=_get_speaker_choices,
-                outputs=[multi_cur_speaker],
-            ).then(
-                fn=_get_remove_choices,
-                outputs=[multi_remove_name],
-            )
-
-            multi_add_btn.click(
-                fn=multi_add_speaker,
-                inputs=[
-                    multi_name, multi_gpt, multi_sovits,
-                    multi_spk_audio, multi_prompt_audio, multi_prompt_text,
-                ],
-                outputs=[multi_table, multi_log],
-            ).then(
-                fn=_get_speaker_choices,
-                outputs=[multi_cur_speaker],
-            ).then(
-                fn=_get_remove_choices,
-                outputs=[multi_remove_name],
-            )
-
-            multi_remove_btn.click(
-                fn=multi_remove_speaker,
-                inputs=[multi_remove_name],
-                outputs=[multi_table, multi_log],
-            ).then(
-                fn=_get_speaker_choices,
-                outputs=[multi_cur_speaker],
-            ).then(
-                fn=_get_remove_choices,
-                outputs=[multi_remove_name],
-            )
-
-            multi_btn.click(
-                fn=multi_infer,
-                inputs=[
-                    multi_cur_speaker, multi_text,
-                    multi_top_k, multi_top_p, multi_temperature,
-                    multi_rep_penalty, multi_noise_scale, multi_speed,
-                    multi_enable_enhance,
-                ],
-                outputs=[multi_output_audio, multi_output_log],
-            )
-
     def update_history(history_entry, current_history):
         if history_entry is None:
             return current_history, gr.update(samples=current_history)
@@ -807,6 +669,21 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             audio_path = selected_row_data[-1] 
             return audio_path
         return None
+
+    def toggle_mode(mode):
+        """Show/hide single-model vs multi-speaker sections."""
+        is_single = mode == "单模型"
+        return (
+            gr.update(visible=is_single),   # single_model_col
+            gr.update(visible=not is_single),  # multi_model_col
+        )
+
+    # ── Mode toggle ──
+    tts_mode.change(
+        fn=toggle_mode,
+        inputs=[tts_mode],
+        outputs=[single_model_col, multi_model_col],
+    )
 
     save_btn.click(
         fn=save_preset,
@@ -882,6 +759,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             enable_enhance,
             is_cut_text, cut_minlen, cut_mute, cut_mute_scale_map,
             sovits_batch_size,
+            tts_mode, multi_cur_speaker,
         ],
         outputs=[output_audio, log_output, temp_history_entry]
     ).then(
@@ -903,6 +781,31 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         fn=load_from_history,
         inputs=[history_display],
         outputs=[output_audio]
+    )
+
+    # ── Multi-speaker management events ──
+    def _refresh_multi_ui():
+        return _get_speaker_choices(), _get_remove_choices()
+
+    multi_add_btn.click(
+        fn=multi_add_speaker,
+        inputs=[multi_name, multi_gpt, multi_sovits,
+                multi_spk_audio, multi_prompt_audio, multi_prompt_text],
+        outputs=[multi_table, multi_log],
+    ).then(
+        fn=_refresh_multi_ui,
+        inputs=[],
+        outputs=[multi_cur_speaker, multi_remove_name],
+    )
+
+    multi_remove_btn.click(
+        fn=multi_remove_speaker,
+        inputs=[multi_remove_name],
+        outputs=[multi_table, multi_log],
+    ).then(
+        fn=_refresh_multi_ui,
+        inputs=[],
+        outputs=[multi_cur_speaker, multi_remove_name],
     )
 
 
