@@ -294,8 +294,64 @@ similarity = tts.verify_speaker("examples\laffey.mp3", "examples\AnAn.ogg")
 print("Speaker Similarity:", similarity)
 ```
 
+#### 6. Multi-Speaker Inference 🆕
+
+`MultiSpeakerTTS` allows loading multiple fine-tuned speakers in a single session, sharing a common GPT + SoVITS backbone. Each speaker adds only ~5-15% lightweight weights.
+
+```python
+from gsv_tts import MultiSpeakerTTS, SpeakerConfig
+
+# Define multiple speakers
+speakers = [
+    SpeakerConfig(
+        name="alice",
+        gpt_model_path="models/alice_gpt.ckpt",
+        sovits_model_path="models/alice_sovits.pth",
+        spk_audio_path="audio/alice_ref.wav",
+        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_text="Hello, I'm Alice.",
+    ),
+    SpeakerConfig(
+        name="bob",
+        gpt_model_path="models/bob_gpt.ckpt",
+        sovits_model_path="models/bob_sovits.pth",
+        spk_audio_path="audio/bob_ref.wav",
+        prompt_audio_path="audio/bob_prompt.ogg",
+        prompt_audio_text="Hello, I'm Bob.",
+    ),
+]
+
+# Load all speakers at once (shared backbone + per-speaker weights)
+tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
+
+# Single-speaker inference — auto-routed by speaker name
+audio = tts.infer("alice", "Good morning!")
+audio.play()
+
+# Batch inference — true GPU parallelism for same-speaker texts
+audios = tts.infer_batched([
+    ("alice", "Hello"),
+    ("alice", "How are you?"),
+    ("bob",   "Nice to meet you"),
+])
+
+# Runtime management
+tts.add_speaker(SpeakerConfig(name="charlie", ...))
+tts.remove_speaker("bob")
+print(tts.speaker_names)  # ["alice", "charlie"]
+```
+
+> [!TIP]
+> **Auto compatibility check**: Architecture parameters (vocab_size, n_layer, gin_channels, upsample_initial_channel, etc.) are validated on load. Incompatible speakers **auto-degrade** to full model loading — no user intervention needed.
+
+| Approach | 1 Speaker | 3 Speakers | 5 Speakers | 10 Speakers |
+|------|--------|--------|--------|---------|
+| Full loading | ~800MB | ~2.4GB | ~4.0GB | ~8.0GB |
+| **MultiSpeakerTTS** | ~800MB | **~1.2GB** | **~1.4GB** | **~2.0GB** |
+| VRAM saved | — | **51%** | **65%** | **75%** |
+
 <details>
-<summary><strong>6. Other Function Interfaces</strong></summary>
+<summary><strong>7. Other Function Interfaces</strong></summary>
 
 ### 1. Model Management
 

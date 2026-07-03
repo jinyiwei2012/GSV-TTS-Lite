@@ -293,8 +293,64 @@ similarity = tts.verify_speaker("examples\laffey.mp3", "examples\AnAn.ogg")
 print("声紋類似度：", similarity)
 ```
 
+#### 6. マルチスピーカー推論 🆕
+
+`MultiSpeakerTTS` は、単一セッションで複数のファインチューニングされた話者をロードし、GPT + SoVITS のモデル骨格を共有します。各話者はわずか ~5-15% の軽量な重みを追加するだけです。
+
+```python
+from gsv_tts import MultiSpeakerTTS, SpeakerConfig
+
+# 複数のキャラクターを定義
+speakers = [
+    SpeakerConfig(
+        name="alice",
+        gpt_model_path="models/alice_gpt.ckpt",
+        sovits_model_path="models/alice_sovits.pth",
+        spk_audio_path="audio/alice_ref.wav",
+        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_text="こんにちは、アリスです。",
+    ),
+    SpeakerConfig(
+        name="bob",
+        gpt_model_path="models/bob_gpt.ckpt",
+        sovits_model_path="models/bob_sovits.pth",
+        spk_audio_path="audio/bob_ref.wav",
+        prompt_audio_path="audio/bob_prompt.ogg",
+        prompt_audio_text="こんにちは、ボブです。",
+    ),
+]
+
+# すべてのキャラクターを一度にロード（共有骨格 + キャラクター専用の重み）
+tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
+
+# 単一キャラクター推論 — キャラクター名で自動ルーティング
+audio = tts.infer("alice", "今日も頑張りましょう！")
+audio.play()
+
+# バッチ推論 — 同じキャラクターは自動的に GPU 並列処理
+audios = tts.infer_batched([
+    ("alice", "こんにちは"),
+    ("alice", "お元気ですか"),
+    ("bob",   "よろしくお願いします"),
+])
+
+# 実行時管理
+tts.add_speaker(SpeakerConfig(name="charlie", ...))
+tts.remove_speaker("bob")
+print(tts.speaker_names)  # ["alice", "charlie"]
+```
+
+> [!TIP]
+> **自動互換性チェック**：ロード時にアーキテクチャパラメータ（vocab_size、n_layer、gin_channels、upsample_initial_channel など）を自動検証。互換性のないキャラクターは**自動的に完全モデル読み込みにデグレード**され、ユーザーの介入は不要です。
+
+| 方式 | 1 キャラ | 3 キャラ | 5 キャラ | 10 キャラ |
+|------|--------|--------|--------|---------|
+| 完全ロード | ~800MB | ~2.4GB | ~4.0GB | ~8.0GB |
+| **MultiSpeakerTTS** | ~800MB | **~1.2GB** | **~1.4GB** | **~2.0GB** |
+| VRAM 節約 | — | **51%** | **65%** | **75%** |
+
 <details>
-<summary><strong>6. その他の関数インターフェース</strong></summary>
+<summary><strong>7. その他の関数インターフェース</strong></summary>
 
 ### 1. モデル管理
 
