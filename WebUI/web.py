@@ -331,22 +331,22 @@ def multi_remove_speaker(name):
 
 
 def _render_speaker_table():
-    """渲染角色列表表格"""
+    """Render speaker list table - returns data directly for Gradio 6.x"""
     if not _speaker_data:
-        return gr.update(
-            headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
-            values=[],
-        )
-    rows = [
+        return []
+    return [
         [s["name"], Path(s["gpt_path"]).name, Path(s["sovits_path"]).name, s["mode"]]
         for s in _speaker_data
     ]
-    speaker_choices = [s["name"] for s in _speaker_data]
-    return gr.update(headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"], values=rows)
 
 
 def _get_speaker_choices():
-    return gr.update(choices=[s["name"] for s in _speaker_data])
+    names = [s["name"] for s in _speaker_data]
+    return gr.update(choices=names, value=names[0] if names else None)
+
+def _get_remove_choices():
+    names = [s["name"] for s in _speaker_data]
+    return gr.update(choices=names)
 
 
 def multi_infer(
@@ -705,6 +705,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 multi_table = gr.Dataframe(
                     headers=["角色名", "GPT 模型", "SoVITS 模型", "模式"],
                     label="已加载角色",
+                    value=[],
                     interactive=False,
                 )
 
@@ -750,7 +751,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 fn=_get_speaker_choices,
                 outputs=[multi_cur_speaker],
             ).then(
-                fn=_get_speaker_choices,
+                fn=_get_remove_choices,
                 outputs=[multi_remove_name],
             )
 
@@ -765,7 +766,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 fn=_get_speaker_choices,
                 outputs=[multi_cur_speaker],
             ).then(
-                fn=_get_speaker_choices,
+                fn=_get_remove_choices,
                 outputs=[multi_remove_name],
             )
 
@@ -777,7 +778,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 fn=_get_speaker_choices,
                 outputs=[multi_cur_speaker],
             ).then(
-                fn=_get_speaker_choices,
+                fn=_get_remove_choices,
                 outputs=[multi_remove_name],
             )
 
