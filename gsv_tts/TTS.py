@@ -316,7 +316,7 @@ class TTS:
         speed: float = 1.0,
         gpt_model: str = None,
         sovits_model: str = None,
-        debug: str = True,
+        debug: bool = True,
     ):
         """
         Performs streaming Text-to-Speech (TTS) inference, yielding audio chunks in real-time.
