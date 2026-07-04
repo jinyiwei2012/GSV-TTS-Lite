@@ -328,6 +328,10 @@ class Text2SemanticDecoder(nn.Module):
         prompt_attn_mask[y_mask1] = y_attn_mask[y_mask2]
 
         prompt_attn_mask = prompt_attn_mask.unsqueeze(1).expand(-1, self.num_head, -1, -1)
+        # PyTorch F.scaled_dot_product_attention bool mask convention:
+        #   True  = MASK this position (do NOT attend)
+        # Our construction uses True = "can attend", so invert.
+        prompt_attn_mask = ~prompt_attn_mask
 
         return xy_pos, last_token_mask, prompt_attn_mask
 
@@ -362,6 +366,8 @@ class Text2SemanticDecoder(nn.Module):
             .expand(B, self.num_head, -1, -1)
             .to(device=device, dtype=torch.bool)
         )
+        # PyTorch convention: True = mask. Our construction uses True = can attend.
+        prompt_attn_mask = ~prompt_attn_mask
         
         return xy_pos, prompt_attn_mask
 
