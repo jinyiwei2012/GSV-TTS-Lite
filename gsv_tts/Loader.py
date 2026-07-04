@@ -450,6 +450,11 @@ def load_shared_gpt(
     t2s_model.eval()
     t2s_model.initialize_runtime(tts_config.dtype, tts_config.device, tts_config.gpt_cache)
 
+    logging.info(
+        "Shared GPT model loaded with RANDOM speaker-specific weights. "
+        "Use MultiSpeaker.infer_batched() or inject weights via copy_() before inference."
+    )
+
     return Gpt(t2s_model, config)
 
 
@@ -497,5 +502,10 @@ def load_shared_sovits(
     vq_model.to(tts_config.device, tts_config.dtype)
     vq_model.eval()
     vq_model.initialize_runtime(tts_config.dtype, tts_config.device, tts_config.sovits_cache)
+
+    logging.info(
+        "Shared SoVITS model loaded with RANDOM speaker-specific weights. "
+        "Use MultiSpeaker.infer_batched() or inject weights via copy_() before inference."
+    )
 
     return Sovits(vq_model, hps)
