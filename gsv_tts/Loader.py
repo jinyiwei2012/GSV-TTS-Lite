@@ -11,7 +11,15 @@ from .GPT_SoVITS.GPT.t2s_model import Text2SemanticDecoder
 from .GPT_SoVITS import utils
 
 import sys
+import logging
+import warnings
+
+# Monkey-patch required for pickle deserialization of legacy GPT-SoVITS checkpoints.
+# Those checkpoints were saved with `utils.DictToAttrRecursive` as a top-level class,
+# and pickle needs ``sys.modules['utils']`` to resolve it during torch.load.
+_ORIG_SYS_UTILS = sys.modules.get("utils")
 sys.modules['utils'] = utils
+logging.debug("Injected GPT-SoVITS 'utils' into sys.modules for checkpoint compatibility")
 
 
 head2version = {
@@ -25,6 +33,18 @@ hash_pretrained_dict = {
     "c7e9fce2223f3db685cdfa1e6368728a": "v2Pro",  # s2Gv2Pro.pth#sovits_v2Pro_pretrained
     "66b313e39455b57ab1b0bc0b239c9d0a": "v2ProPlus",  # s2Gv2ProPlus.pth#sovits_v2ProPlus_pretrained
 }
+
+# Emit once: torch.load(weights_only=False) is used for GPT-SoVITS checkpoint
+# compatibility (custom classes like DictToAttrRecursive).  Only load models from
+# trusted sources.  Migrate to safetensors via tts.to_safetensors() for safety.
+if not hasattr(torch, "_gsv_tts_weights_only_warned"):
+    torch._gsv_tts_weights_only_warned = True
+    warnings.warn(
+        "Loading models with pickle deserialization (weights_only=False). "
+        "Only load models from trusted sources. "
+        "Convert to safetensors via tts.to_safetensors() for improved security.",
+        UserWarning,
+    )
 
 
 class Sovits:
@@ -47,6 +67,14 @@ def load_sovits(sovits_path):
 
     version = head2version.get(meta)
     if version is None: version = hash_pretrained_dict.get(hash)
+
+    if version is None:
+        logging.warning(
+            f"Could not determine SoVITS version for {os.path.basename(sovits_path)}. "
+            f"File header bytes: {meta!r}, MD5: {hash}. "
+            f"Defaulting to 'v2'. Set version explicitly if incorrect."
+        )
+        version = "v2"
     
     if meta != b"PK":
         data = b"PK" + f.read()
@@ -80,7 +108,14 @@ def get_sovits_weights(sovits_path, tts_config: Config):
         hps = utils.DictToAttrRecursive(dict_s2["config"])
         hps.model.semantic_frame_rate = "25hz"
         if version is None:
-            assert getattr(hps.model, 'version', None) in ["v2", "v2Pro", "v2ProPlus"], "The Sovits model is not the v2/v2pro/v2proplus version. Please check the model file."
+            supported = ["v2", "v2Pro", "v2ProPlus"]
+            detected = getattr(hps.model, 'version', None)
+            if detected not in supported:
+                raise ValueError(
+                    f"The SoVITS model version '{detected}' is not supported. "
+                    f"Supported versions: {', '.join(supported)}. "
+                    f"Please check the model file."
+                )
         else:
             hps.model.version = version
         
