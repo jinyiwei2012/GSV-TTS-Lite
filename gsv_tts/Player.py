@@ -1,13 +1,18 @@
 import os
 import json
 import queue
+import logging
 import numpy as np
 import soundfile as sf
 import threading
 try:
     import sounddevice as sd
-except:
-    pass
+except ImportError:
+    sd = None
+    logging.warning("sounddevice not available — audio playback disabled")
+
+
+_SENTINEL = object()
 
 
 class AudioQueue:
@@ -25,7 +30,7 @@ class AudioQueue:
                 dtype='float32'
             )
             self.stream.start()
-        except:
+        except Exception:
             self.stream = None
 
     def put(self, data):
@@ -40,10 +45,16 @@ class AudioQueue:
             self.t.start()
 
     def _run_playback(self):
-        while not self.q.empty():
+        while True:
             data = self.q.get()
-            if self.stream:
-                self.stream.write(data)
+            if data is _SENTINEL:
+                break
+            if self.stream is not None:
+                try:
+                    self.stream.write(data)
+                except Exception as e:
+                    logging.warning(f"Audio playback error: {e}")
+                    break
         
         self.playback_finished.set()
 
@@ -51,20 +62,39 @@ class AudioQueue:
         """
         Immediately stops playback and clears all audio data in the queue.
         """
-        with self.q.mutex:
-            self.q.queue.clear()
+        # Drain queue using sentinel
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+        self.q.put(_SENTINEL)
 
-        if self.stream:
+        if self.t is not None and self.t.is_alive():
+            self.t.join(timeout=5.0)
+
+        if self.stream is not None:
             self.stream.stop()
             self.stream.start()
         
         self.playback_finished.set()
 
-    def wait(self):
+    def wait(self, timeout: float = 30.0):
         """
         Waits until all audio currently in the queue has finished playing.
+
+        Args:
+            timeout: Maximum time to wait in seconds. Defaults to 30.0.
         """
-        self.playback_finished.wait()
+        if not self.playback_finished.wait(timeout=timeout):
+            logging.warning("Audio playback did not finish within timeout")
+
+    def close(self):
+        """Clean up resources."""
+        self.stop()
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
 
 
 class AudioClip:
@@ -80,17 +110,25 @@ class AudioClip:
         """
         Adds the audio data to the playback queue for sequential output.
         """
-
+        audio = self.audio_data
         if volume != 1.0:
-            self.audio_data = self.audio_data * volume
-            self.audio_data = np.clip(self.audio_data, -1.0, 1.0)
+            audio = audio * volume
+            audio = np.clip(audio, -1.0, 1.0)
 
-        self.audio_queue.put(self.audio_data)
+        self.audio_queue.put(audio)
     
-    def save(self, save_path: str, is_save_subtitles: bool = False):
+    def save(self, save_path: str, is_save_subtitles: bool = False, exist_ok: bool = False):
         """
         Saves the audio data to a file and optionally exports subtitles as a JSON file.
+
+        Args:
+            save_path: Output file path.
+            is_save_subtitles: Whether to also save a .json subtitle file.
+            exist_ok: If False (default), raises FileExistsError when the file already exists.
         """
+        if not exist_ok and os.path.exists(save_path):
+            raise FileExistsError(f"File already exists: {save_path}")
+
         sf.write(save_path, self.audio_data, self.samplerate)
 
         if is_save_subtitles:
