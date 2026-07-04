@@ -209,10 +209,13 @@ class TextEncoder(nn.Module):
         if stream_mode:
             y = y[:, :, valid_start_idx:]
             y_mask = y_mask[:, :, valid_start_idx:]
-            alpha = torch.linspace(0, 1, overlap_len, dtype=y.dtype, device=y.device).view(1, 1, -1)
-            if not self.y_overlap is None:
-                y[:, :, :overlap_len] = self.y_overlap*(1-alpha) + y[:, :, :overlap_len]*alpha
-            self.y_overlap = y[:, :, -overlap_len:]
+            if overlap_len > 0:
+                alpha = torch.linspace(0, 1, overlap_len, dtype=y.dtype, device=y.device).view(1, 1, -1)
+                if self.y_overlap is not None:
+                    y[:, :, :overlap_len] = self.y_overlap * (1 - alpha) + y[:, :, :overlap_len] * alpha
+                self.y_overlap = y[:, :, -overlap_len:].detach().clone()
+            else:
+                self.y_overlap = None
         
         if speed != 1:
             y = F.interpolate(y, size=int(y.shape[-1] / speed) + 1, mode="linear")

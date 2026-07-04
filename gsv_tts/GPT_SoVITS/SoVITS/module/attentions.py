@@ -59,6 +59,11 @@ class Encoder(nn.Module):
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         if g is not None:
+            if not hasattr(self, 'cond_layer'):
+                raise ValueError(
+                    "Encoder does not support global conditioning (g). "
+                    "Set g=None for this Encoder variant."
+                )
             g = self.cond_layer(g)
 
         for i in range(self.n_layers):
