@@ -33,6 +33,7 @@ from .GPT_SoVITS.G2P import text_to_phonemes
 from .Player import AudioQueue, AudioClip
 from .Config import Config, global_config
 from .GPT_SoVITS.G2P import Pause
+from .LangSegment import LangSegment
 
 
 class TTS:
@@ -1227,7 +1228,7 @@ class TTS:
 
         return sovits, ge
     
-    def verify_speaker(self, speaker1_audio: str, speaker2_audio: str):
+    def verify_speaker(self, speaker1_audio: str, speaker2_audio: str) -> float | None:
         """
         Verifies the similarity between two speaker audio files.
 
@@ -1236,7 +1237,7 @@ class TTS:
             speaker2_audio (str): Path to the second speaker's audio file.
 
         Returns:
-            numpy.ndarray: A similarity score between the two speakers' embeddings.
+            float | None: Cosine similarity score (0~1), or None if no SoVITS model is loaded.
         """
 
         try:
@@ -1548,7 +1549,6 @@ class TTS:
             self._empty_cache()
     
     def _contains_chinese(self, text: str) -> bool:
-        from .LangSegment import LangSegment
         segments = LangSegment.getTexts(text)
         for segment in segments:
             if segment['lang'] == 'zh':
@@ -1770,6 +1770,16 @@ class TTS:
                 subtitle["end_s"] += increment
 
     def _viterbi_monotonic(self, attn: torch.Tensor):
+        """
+        Compute a monotonic alignment path through the attention matrix
+        using Viterbi DP.  Used to map each output audio frame to the
+        input phone that most likely produced it.
+
+        Returns:
+            torch.Tensor: Integer indices of shape (T,) mapping each
+            time step to the input position with maximum cumulative
+            log-probability.
+        """
         B, T, N = attn.shape
         device = attn.device
 
