@@ -375,6 +375,8 @@ class TTS:
 
             if stream_mode == "sentence": stream_chunk: int = 10000
             if not is_cut_text: cut_minlen = 10000
+            if speed <= 0:
+                raise ValueError(f"speed must be positive, got {speed}")
             cut_mute = cut_mute / speed
 
             if gpt_model is None:
@@ -590,6 +592,8 @@ class TTS:
             texts = [t if self._check_pause(t) else t + "." for t in texts]
 
             if not is_cut_text: cut_minlen = 10000
+            if speed <= 0:
+                raise ValueError(f"speed must be positive, got {speed}")
             cut_mute = cut_mute / speed
 
             n = len(texts)
@@ -1557,20 +1561,23 @@ class TTS:
             return
         if not self.auto_bert:
             return
-        # CPU 场景：下载 INT8 ONNX 模型
-        if self.tts_config.device.type == "cpu":
-            int8_onnx_path = self.cnroberta_path / "cnroberta_int8_dynamic.onnx"
-            if not int8_onnx_path.exists():
-                download_cnroberta_int8(dir=self.cnroberta_path)
-        # GPU 场景：下载原始 PyTorch 模型
-        elif not os.path.exists(self.cnroberta_path):
-            download_model(
-                filename="chinese-roberta.zip",
-                dir=self.models_dir,
-            )
-        self.tts_config.cnroberta = CNRoberta(self.cnroberta_path, self.tts_config)
-        self._bert_loaded = True
-        logging.info("BERT model loaded lazily for Chinese text")
+        with self._infer_lock:
+            if self._bert_loaded:  # Double-check after acquiring lock
+                return
+            # CPU 场景：下载 INT8 ONNX 模型
+            if self.tts_config.device.type == "cpu":
+                int8_onnx_path = self.cnroberta_path / "cnroberta_int8_dynamic.onnx"
+                if not int8_onnx_path.exists():
+                    download_cnroberta_int8(dir=self.cnroberta_path)
+            # GPU 场景：下载原始 PyTorch 模型
+            elif not os.path.exists(self.cnroberta_path):
+                download_model(
+                    filename="chinese-roberta.zip",
+                    dir=self.models_dir,
+                )
+            self.tts_config.cnroberta = CNRoberta(self.cnroberta_path, self.tts_config)
+            self._bert_loaded = True
+            logging.info("BERT model loaded lazily for Chinese text")
     
     def _check_pause(self, text: str):
         return text.endswith(self.punctuation) or text[-3:] in ["...", "。。。"]
@@ -1850,6 +1857,7 @@ class TTS:
             if self.tts_config.device.type == "cuda":
                 torch.cuda.empty_cache()
             elif self.tts_config.device.type == "mps":
-                torch.mps.empty_cache()
-        except:
+                if hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+        except Exception:
             pass
