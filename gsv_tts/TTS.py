@@ -217,16 +217,8 @@ class TTS:
             else:
                 logging.info(f"Starting inference for text: '{text}'")
 
-            if gpt_model is None:
-                if len(self.gpt_models) > 0:
-                    gpt_model = list(self.gpt_models.keys())[0]
-                else:
-                    gpt_model = self.default_gpt_path
-            if sovits_model is None:
-                if len(self.sovits_models) > 0:
-                    sovits_model = list(self.sovits_models.keys())[0]
-                else:
-                    sovits_model = self.default_sovits_path
+            gpt_model = self._resolve_gpt_model(gpt_model)
+            sovits_model = self._resolve_sovits_model(sovits_model)
 
             logging.info(f"Using GPT model: {gpt_model}")
             logging.info(f"Using SoVITS model: {sovits_model}")
@@ -388,16 +380,8 @@ class TTS:
                 cut_mute_scale_map = self._CUT_MUTE_SCALE_MAP
             cut_mute = cut_mute / speed
 
-            if gpt_model is None:
-                if len(self.gpt_models) > 0:
-                    gpt_model = list(self.gpt_models.keys())[0]
-                else:
-                    gpt_model = self.default_gpt_path
-            if sovits_model is None:
-                if len(self.sovits_models) > 0:
-                    sovits_model = list(self.sovits_models.keys())[0]
-                else:
-                    sovits_model = self.default_sovits_path
+            gpt_model = self._resolve_gpt_model(gpt_model)
+            sovits_model = self._resolve_sovits_model(sovits_model)
 
             logging.info(f"Using GPT model: {gpt_model}")
             logging.info(f"Using SoVITS model: {sovits_model}")
@@ -618,16 +602,8 @@ class TTS:
             if isinstance(prompt_audio_texts, str):
                 prompt_audio_texts = [prompt_audio_texts]*n
 
-            if gpt_model is None:
-                if len(self.gpt_models) > 0:
-                    gpt_model = list(self.gpt_models.keys())[0]
-                else:
-                    gpt_model = self.default_gpt_path
-            if sovits_model is None:
-                if len(self.sovits_models) > 0:
-                    sovits_model = list(self.sovits_models.keys())[0]
-                else:
-                    sovits_model = self.default_sovits_path
+            gpt_model = self._resolve_gpt_model(gpt_model)
+            sovits_model = self._resolve_sovits_model(sovits_model)
 
             logging.info(f"Using GPT model: {gpt_model}")
             logging.info(f"Using SoVITS model: {sovits_model}")
@@ -944,11 +920,7 @@ class TTS:
 
             logging.info(f"Starting VC inference. Prompt audio: {prompt_audio_path}")
 
-            if sovits_model is None:
-                if len(self.sovits_models) > 0:
-                    sovits_model = list(self.sovits_models.keys())[0]
-                else:
-                    sovits_model = self.default_sovits_path
+            sovits_model = self._resolve_sovits_model(sovits_model)
             
             logging.info(f"Using SoVITS model: {sovits_model}")
 
@@ -1197,6 +1169,22 @@ class TTS:
             return await loop.run_in_executor(None, _infer_batched_with_lock)
         else:
             return await loop.run_in_executor(executor, _infer_batched_with_lock)
+    
+    def _resolve_gpt_model(self, gpt_model: str | None):
+        """Resolve GPT model: user-specified > first loaded > default path."""
+        if gpt_model is not None:
+            return gpt_model
+        if self.gpt_models:
+            return next(iter(self.gpt_models))
+        return self.default_gpt_path
+
+    def _resolve_sovits_model(self, sovits_model: str | None):
+        """Resolve SoVITS model: user-specified > first loaded > default path."""
+        if sovits_model is not None:
+            return sovits_model
+        if self.sovits_models:
+            return next(iter(self.sovits_models))
+        return self.default_sovits_path
     
     def _prepare_gpt_resources(self, gpt_model, prompt_audio_path, prompt_audio_text):
         if gpt_model not in self.gpt_models:
