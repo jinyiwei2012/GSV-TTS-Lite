@@ -191,8 +191,13 @@ class TTS:
                 - audio_len_s (float): The duration of the generated audio in seconds.
                 - subtitles (list): Subtitle data corresponding to the generated audio.
                 - orig_text (str): The original input text.
+
+        Note:
+            This method is thread-safe — it acquires ``_infer_lock`` to serialize all
+            inference calls and protect shared state (model caches, G2P modules, etc.).
         """
 
+        self._infer_lock.acquire()
         try:
             if self._contains_chinese(text):
                 self._ensure_bert_loaded()
@@ -284,6 +289,7 @@ class TTS:
             return AudioClip(self.audio_queue, audio, self.samplerate, audio_len_s, subtitles, text)
         
         finally:
+            self._infer_lock.release()
             self._empty_cache()
 
     @torch.inference_mode()
@@ -348,8 +354,13 @@ class TTS:
                 - audio_len_s (float): The duration of the generated audio in seconds.
                 - subtitles (list): Subtitle data specific to this chunk.
                 - orig_text (str): The original input text.
+
+        Note:
+            This method is thread-safe — it acquires ``_infer_lock`` to serialize all
+            inference calls.  The lock is held for the entire streaming duration.
         """
 
+        self._infer_lock.acquire()
         try:
             if self._contains_chinese(text):
                 self._ensure_bert_loaded()
@@ -502,6 +513,7 @@ class TTS:
             if debug: logging.info(f"Stream inference complete. Generated {audio_len_s:.2f}s of audio.")
         
         finally:
+            self._infer_lock.release()
             self._empty_cache()
     
     @torch.inference_mode()
@@ -561,8 +573,13 @@ class TTS:
                 - audio_len_s (float): The duration of the generated audio in seconds.
                 - subtitles (list): Subtitle data specific to this chunk.
                 - orig_text (str): The original input text.
+
+        Note:
+            This method is thread-safe — it acquires ``_infer_lock`` to serialize all
+            inference calls and protect shared state.
         """
         
+        self._infer_lock.acquire()
         try:
             if isinstance(texts, str):
                 texts = [texts]
@@ -866,6 +883,7 @@ class TTS:
             return tuple(result)
         
         finally:
+            self._infer_lock.release()
             self._empty_cache()
     
     @torch.inference_mode()
@@ -898,8 +916,13 @@ class TTS:
                 - audio_len_s (float): The duration of the generated audio in seconds.
                 - subtitles (list): Subtitle data corresponding to the generated audio.
                 - orig_text (str): The original input text.
+
+        Note:
+            This method is thread-safe — it acquires ``_infer_lock`` to serialize all
+            inference calls and protect shared state.
         """
 
+        self._infer_lock.acquire()
         try:
             if not self._check_pause(prompt_audio_text):
                 prompt_audio_text += "."
@@ -962,6 +985,7 @@ class TTS:
             return AudioClip(self.audio_queue, audio, self.samplerate, audio_len_s, subtitles, prompt_audio_text)
         
         finally:
+            self._infer_lock.release()
             self._empty_cache()
 
     async def infer_async(
@@ -994,22 +1018,21 @@ class TTS:
         loop = asyncio.get_running_loop()
         
         def _infer_with_lock():
-            with self._infer_lock:
-                return self.infer(
-                    spk_audio_path=spk_audio_path,
-                    prompt_audio_path=prompt_audio_path,
-                    prompt_audio_text=prompt_audio_text,
-                    text=text,
-                    return_subtitles=return_subtitles,
-                    top_k=top_k,
-                    top_p=top_p,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    noise_scale=noise_scale,
-                    speed=speed,
-                    gpt_model=gpt_model,
-                    sovits_model=sovits_model,
-                )
+            return self.infer(
+                spk_audio_path=spk_audio_path,
+                prompt_audio_path=prompt_audio_path,
+                prompt_audio_text=prompt_audio_text,
+                text=text,
+                return_subtitles=return_subtitles,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                noise_scale=noise_scale,
+                speed=speed,
+                gpt_model=gpt_model,
+                sovits_model=sovits_model,
+            )
         
         if executor is None:
             return await loop.run_in_executor(None, _infer_with_lock)
@@ -1058,32 +1081,31 @@ class TTS:
 
         def _stream_wrapper():
             try:
-                with self._infer_lock:
-                    for chunk in self.infer_stream(
-                        spk_audio_path=spk_audio_path,
-                        prompt_audio_path=prompt_audio_path,
-                        prompt_audio_text=prompt_audio_text,
-                        text=text,
-                        return_subtitles=return_subtitles,
-                        is_cut_text=is_cut_text,
-                        cut_minlen=cut_minlen,
-                        cut_mute=cut_mute,
-                        cut_mute_scale_map=cut_mute_scale_map,
-                        stream_mode=stream_mode,
-                        stream_chunk=stream_chunk,
-                        overlap_len=overlap_len,
-                        boost_first_chunk=boost_first_chunk,
-                        top_k=top_k,
-                        top_p=top_p,
-                        temperature=temperature,
-                        repetition_penalty=repetition_penalty,
-                        noise_scale=noise_scale,
-                        speed=speed,
-                        gpt_model=gpt_model,
-                        sovits_model=sovits_model,
-                        debug=debug
-                    ):
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                for chunk in self.infer_stream(
+                    spk_audio_path=spk_audio_path,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    return_subtitles=return_subtitles,
+                    is_cut_text=is_cut_text,
+                    cut_minlen=cut_minlen,
+                    cut_mute=cut_mute,
+                    cut_mute_scale_map=cut_mute_scale_map,
+                    stream_mode=stream_mode,
+                    stream_chunk=stream_chunk,
+                    overlap_len=overlap_len,
+                    boost_first_chunk=boost_first_chunk,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    gpt_model=gpt_model,
+                    sovits_model=sovits_model,
+                    debug=debug
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
@@ -1134,28 +1156,27 @@ class TTS:
         loop = asyncio.get_running_loop()
         
         def _infer_batched_with_lock():
-            with self._infer_lock:
-                return self.infer_batched(
-                    spk_audio_paths=spk_audio_paths,
-                    prompt_audio_paths=prompt_audio_paths,
-                    prompt_audio_texts=prompt_audio_texts,
-                    texts=texts,
-                    return_subtitles=return_subtitles,
-                    is_cut_text=is_cut_text,
-                    cut_minlen=cut_minlen,
-                    cut_mute=cut_mute,
-                    cut_mute_scale_map=cut_mute_scale_map,
-                    top_k=top_k,
-                    top_p=top_p,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    noise_scale=noise_scale,
-                    speed=speed,
-                    bert_batch_size=bert_batch_size,
-                    sovits_batch_size=sovits_batch_size,
-                    gpt_model=gpt_model,
-                    sovits_model=sovits_model,
-                )
+            return self.infer_batched(
+                spk_audio_paths=spk_audio_paths,
+                prompt_audio_paths=prompt_audio_paths,
+                prompt_audio_texts=prompt_audio_texts,
+                texts=texts,
+                return_subtitles=return_subtitles,
+                is_cut_text=is_cut_text,
+                cut_minlen=cut_minlen,
+                cut_mute=cut_mute,
+                cut_mute_scale_map=cut_mute_scale_map,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                noise_scale=noise_scale,
+                speed=speed,
+                bert_batch_size=bert_batch_size,
+                sovits_batch_size=sovits_batch_size,
+                gpt_model=gpt_model,
+                sovits_model=sovits_model,
+            )
         
         if executor is None:
             return await loop.run_in_executor(None, _infer_batched_with_lock)
