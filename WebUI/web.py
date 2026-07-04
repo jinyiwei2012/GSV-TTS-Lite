@@ -35,6 +35,13 @@ from gsv_tts import TTS, AudioClip, MultiSpeakerTTS, SpeakerConfig, ConfigMismat
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 logging.getLogger('httpx').setLevel(logging.CRITICAL)
 
+# Module-level sentinel defaults — avoid NameError when module is imported
+# (e.g. Gradio reload).  Actual values are set in the __main__ block.
+GSV_ROOT_DIR: str | None = None
+tts: TTS | None = None
+multi_tts: MultiSpeakerTTS | None = None
+asr = None
+
 
 # Copied from https://github.com/Icelinea/BetterAIVoice/blob/main/process.py
 def enhance_audio(audio_data, sample_rate):
@@ -87,7 +94,7 @@ S2_MODEL_PATH = [
 ]
 
 def find_gsv_models():
-    if not os.path.isdir(GSV_ROOT_DIR):
+    if GSV_ROOT_DIR is None or not os.path.isdir(GSV_ROOT_DIR):
         return gr.update(choices=['']), gr.update(choices=[''])
     s1 = ['']
     s2 = ['']
@@ -103,6 +110,8 @@ def find_gsv_models():
 
 
 def upload_gpt(new_gpt):
+    if tts is None:
+        raise RuntimeError("TTS not initialized. Run web.py as main module.")
     if not new_gpt is None:
         for gpt in tts.get_gpt_list():
             tts.unload_gpt_model(gpt)
@@ -110,6 +119,8 @@ def upload_gpt(new_gpt):
         tts.load_gpt_model(new_gpt.strip('"“”'))
 
 def upload_sovits(new_sovits):
+    if tts is None:
+        raise RuntimeError("TTS not initialized. Run web.py as main module.")
     if not new_sovits is None:
         for sovits in tts.get_sovits_list():
             tts.unload_sovits_model(sovits)
