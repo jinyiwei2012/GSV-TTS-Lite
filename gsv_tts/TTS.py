@@ -512,6 +512,169 @@ class TTS:
             self._infer_lock.release()
             self._empty_cache()
     
+    # ── Batched inference helpers ──────────────────────────────
+
+    class _BatchedInputs:
+        """Intermediate state for batched inference pipeline."""
+        __slots__ = (
+            "texts", "orig_texts", "segment_to_original_map",
+            "n_orig", "n_segs", "cut_mute", "cut_mute_scale_map",
+            "speed", "sovits_model", "return_subtitles",
+            "all_phones2", "all_word2ph", "all_bert2", "all_norm_text",
+            "all_phoneme_ids", "all_prompts", "all_bert_features", "all_ge",
+        )
+
+    def _prepare_batched_inputs(
+        self,
+        texts, spk_audio_paths, prompt_audio_paths, prompt_audio_texts,
+        return_subtitles, is_cut_text, cut_minlen, cut_mute,
+        cut_mute_scale_map, speed, bert_batch_size, gpt_model, sovits_model,
+    ) -> _BatchedInputs:
+        """Prepare all inputs for batched GPT+SoVITS inference.
+
+        Returns a ``_BatchedInputs`` holding segmented texts, BERT features,
+        phoneme IDs, prompt embeddings, and speaker-conditioning tensors.
+        Caller MUST already hold ``_infer_lock``.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if any(self._contains_chinese(t) for t in texts):
+            self._ensure_bert_loaded()
+
+        texts = [t if self._check_pause(t) else t + "." for t in texts]
+
+        if not is_cut_text:
+            cut_minlen = 10000
+        if speed <= 0:
+            raise ValueError(f"speed must be positive, got {speed}")
+        if cut_mute_scale_map is None:
+            cut_mute_scale_map = self._CUT_MUTE_SCALE_MAP
+        cut_mute = cut_mute / speed
+
+        n = len(texts)
+
+        logging.info(f"Starting batched TTS inference: processing {n} text segments.")
+
+        if isinstance(spk_audio_paths, (str, dict)):
+            spk_audio_paths = [spk_audio_paths] * n
+        if isinstance(prompt_audio_paths, str):
+            prompt_audio_paths = [prompt_audio_paths] * n
+        if isinstance(prompt_audio_texts, str):
+            prompt_audio_texts = [prompt_audio_texts] * n
+
+        gpt_model = self._resolve_gpt_model(gpt_model)
+        sovits_model = self._resolve_sovits_model(sovits_model)
+
+        logging.info(f"Using GPT model: {gpt_model}")
+        logging.info(f"Using SoVITS model: {sovits_model}")
+
+        if gpt_model not in self.gpt_models:
+            self.load_gpt_model(gpt_model)
+        if sovits_model not in self.sovits_models:
+            self.load_sovits_model(sovits_model)
+
+        # ── Text segmentation ──
+        all_segments = []
+        segment_to_original_map = []
+
+        for idx, t in enumerate(texts):
+            text_cuts = cut_text(t, cut_minlen)
+            for text_cut in text_cuts:
+                all_segments.append(text_cut)
+                segment_to_original_map.append(idx)
+
+        n_orig = len(texts)
+        n_segs = len(all_segments)
+
+        def _expand(inp):
+            return [inp[segment_to_original_map[i]] for i in range(n_segs)]
+
+        spk_audio_paths = _expand(spk_audio_paths)
+        prompt_audio_paths = _expand(prompt_audio_paths)
+        prompt_audio_texts = _expand(prompt_audio_texts)
+
+        orig_texts = texts
+        texts = all_segments
+
+        # ── BERT feature extraction ──
+        logging.info("Processing text to phones and BERT features...")
+
+        all_phones2 = []
+        all_word2ph = []
+        all_bert2 = []
+        all_norm_text = []
+
+        for i in tqdm(range(0, len(texts), bert_batch_size)):
+            batch = texts[i: i + bert_batch_size]
+            bp, bw, bb, bn = get_phones_and_bert(batch, self.tts_config)
+            all_phones2.extend(bp)
+            all_word2ph.extend(bw)
+            all_bert2.extend(bb)
+            all_norm_text.extend(bn)
+
+        # ── Prompt + speaker embedding assembly ──
+        all_phoneme_ids = []
+        all_prompts = []
+        all_bert_features = []
+        all_ge = []
+
+        for items in zip(spk_audio_paths, prompt_audio_paths,
+                          prompt_audio_texts, all_phones2, all_bert2):
+            (spk_path, prm_path, prm_text, phones2, bert2) = items
+
+            if prm_path not in self.prompt_audio_cache:
+                self.cache_prompt_audio(prompt_audio_paths=prm_path,
+                                         prompt_audio_texts=prm_text)
+
+            prompt = self.prompt_audio_cache[prm_path]["prompt"]
+            phones1 = self.prompt_audio_cache[prm_path]["phones1"]
+            bert1 = self.prompt_audio_cache[prm_path]["bert1"]
+
+            if isinstance(spk_path, dict):
+                wsum = sum(spk_path.values())
+                ge = None
+                for ap, w in spk_path.items():
+                    if (ap not in self.spk_audio_cache or
+                            sovits_model not in self.spk_audio_cache[ap]["ge"]):
+                        self.cache_spk_audio(ap, sovits_model=sovits_model)
+                    gv = self.spk_audio_cache[ap]["ge"][sovits_model]
+                    ge = gv * (w / wsum) if ge is None else ge + gv * (w / wsum)
+            else:
+                if (spk_path not in self.spk_audio_cache or
+                        sovits_model not in self.spk_audio_cache[spk_path]["ge"]):
+                    self.cache_spk_audio(spk_path, sovits_model=sovits_model)
+                ge = self.spk_audio_cache[spk_path]["ge"][sovits_model]
+
+            phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.tts_config.device)
+            bert = torch.cat([bert1, bert2])
+
+            all_phoneme_ids.append(phoneme_ids)
+            all_prompts.append(prompt.squeeze(0))
+            all_bert_features.append(bert)
+            all_ge.append(ge.squeeze(0))
+
+        inp = TTS._BatchedInputs()
+        inp.texts = texts
+        inp.orig_texts = orig_texts
+        inp.segment_to_original_map = segment_to_original_map
+        inp.n_orig = n_orig
+        inp.n_segs = n_segs
+        inp.cut_mute = cut_mute
+        inp.cut_mute_scale_map = cut_mute_scale_map
+        inp.speed = speed
+        inp.sovits_model = sovits_model
+        inp.return_subtitles = return_subtitles
+        inp.all_phones2 = all_phones2
+        inp.all_word2ph = all_word2ph
+        inp.all_bert2 = all_bert2
+        inp.all_norm_text = all_norm_text
+        inp.all_phoneme_ids = all_phoneme_ids
+        inp.all_prompts = all_prompts
+        inp.all_bert_features = all_bert_features
+        inp.all_ge = all_ge
+        return inp
+
     @torch.inference_mode()
     def infer_batched(
         self,
@@ -577,135 +740,35 @@ class TTS:
         
         self._infer_lock.acquire()
         try:
-            if isinstance(texts, str):
-                texts = [texts]
-            
-            if any(self._contains_chinese(t) for t in texts):
-                self._ensure_bert_loaded()
-            
-            texts = [t if self._check_pause(t) else t + "." for t in texts]
+            inp = self._prepare_batched_inputs(
+                texts=texts,
+                spk_audio_paths=spk_audio_paths,
+                prompt_audio_paths=prompt_audio_paths,
+                prompt_audio_texts=prompt_audio_texts,
+                return_subtitles=return_subtitles,
+                is_cut_text=is_cut_text,
+                cut_minlen=cut_minlen,
+                cut_mute=cut_mute,
+                cut_mute_scale_map=cut_mute_scale_map,
+                speed=speed,
+                bert_batch_size=bert_batch_size,
+                gpt_model=gpt_model,
+                sovits_model=sovits_model,
+            )
 
-            if not is_cut_text: cut_minlen = 10000
-            if speed <= 0:
-                raise ValueError(f"speed must be positive, got {speed}")
-            if cut_mute_scale_map is None:
-                cut_mute_scale_map = self._CUT_MUTE_SCALE_MAP
-            cut_mute = cut_mute / speed
-
-            n = len(texts)
-
-            logging.info(f"Starting batched TTS inference: processing {n} text segments.")
-
-            if isinstance(spk_audio_paths, (str,dict)):
-                spk_audio_paths = [spk_audio_paths]*n
-            if isinstance(prompt_audio_paths, str):
-                prompt_audio_paths = [prompt_audio_paths]*n
-            if isinstance(prompt_audio_texts, str):
-                prompt_audio_texts = [prompt_audio_texts]*n
-
+            # Resolve models for inference
             gpt_model = self._resolve_gpt_model(gpt_model)
-            sovits_model = self._resolve_sovits_model(sovits_model)
-
-            logging.info(f"Using GPT model: {gpt_model}")
-            logging.info(f"Using SoVITS model: {sovits_model}")
-
-            if gpt_model not in self.gpt_models:
-                self.load_gpt_model(gpt_model)
-            if sovits_model not in self.sovits_models:
-                self.load_sovits_model(sovits_model)
-
+            sovits_model = inp.sovits_model
             gpt = self.gpt_models[gpt_model]
             sovits = self.sovits_models[sovits_model]
-
             t2s_model = gpt.t2s_model
             vq_model = sovits.vq_model
 
-            all_segments = []
-            segment_to_original_map = []
-            
-            for idx, text in enumerate(texts):
-                text_cuts = cut_text(text, cut_minlen)
-                for text_cut in text_cuts:
-                    all_segments.append(text_cut)
-                    segment_to_original_map.append(idx)
-            
-            n_orig = len(texts)
-            n_segs = len(all_segments)
-
-            def expand_input(inp):
-                return [inp[segment_to_original_map[i]] for i in range(n_segs)]
-
-            spk_audio_paths = expand_input(spk_audio_paths)
-            prompt_audio_paths = expand_input(prompt_audio_paths)
-            prompt_audio_texts = expand_input(prompt_audio_texts)
-
-            orig_texts = texts
-            texts = all_segments
-
-            logging.info("Processing text to phones and BERT features...")
-
-            all_phones2 = []
-            all_word2ph = []
-            all_bert2 = []
-            all_norm_text = []
-
-            for i in tqdm(range(0, len(texts), bert_batch_size)):
-                batch_texts = texts[i : i + bert_batch_size]
-                
-                batch_phones2, batch_word2ph, batch_bert2, batch_norm_text = get_phones_and_bert(batch_texts, self.tts_config)
-                
-                all_phones2.extend(batch_phones2)
-                all_word2ph.extend(batch_word2ph)
-                all_bert2.extend(batch_bert2)
-                all_norm_text.extend(batch_norm_text)
-            
-            all_phoneme_ids = []
-            all_prompts = []
-            all_bert_features = []
-            all_ge = []
-
-            for items in zip(spk_audio_paths, prompt_audio_paths, prompt_audio_texts, all_phones2, all_bert2):
-        
-                (spk_audio_path, prompt_audio_path, prompt_audio_text, phones2, bert2) = items
-
-                if prompt_audio_path not in self.prompt_audio_cache:
-                    self.cache_prompt_audio(prompt_audio_paths=prompt_audio_path, prompt_audio_texts=prompt_audio_text)
-
-                prompt = self.prompt_audio_cache[prompt_audio_path]["prompt"]
-                phones1 = self.prompt_audio_cache[prompt_audio_path]["phones1"]
-                bert1 = self.prompt_audio_cache[prompt_audio_path]["bert1"]
-            
-                if isinstance(spk_audio_path, dict):
-                    weight_sum = sum(spk_audio_path.values())
-
-                    ge = None
-                    for audio_path, weight in spk_audio_path.items():
-                        if (audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[audio_path]["ge"]):
-                            self.cache_spk_audio(audio_path, sovits_model=sovits_model)
-
-                        if ge is None:
-                            ge = self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
-                        else:
-                            ge += self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
-                else:
-                    if (spk_audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[spk_audio_path]["ge"]):
-                        self.cache_spk_audio(spk_audio_path, sovits_model=sovits_model)
-
-                    ge = self.spk_audio_cache[spk_audio_path]["ge"][sovits_model]
-
-                phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.tts_config.device)
-                bert = torch.cat([bert1, bert2])
-                
-                all_phoneme_ids.append(phoneme_ids)
-                all_prompts.append(prompt.squeeze(0))
-                all_bert_features.append(bert)
-                all_ge.append(ge.squeeze(0))
-
             logging.info("Running GPT batched inference (Text-to-Semantic)...")
             pred_semantic, semantic_orig_idx = t2s_model.infer_batched(
-                all_phoneme_ids,
-                all_prompts,
-                all_bert_features,
+                inp.all_phoneme_ids,
+                inp.all_prompts,
+                inp.all_bert_features,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
@@ -747,9 +810,9 @@ class TTS:
                 phone_lens = []
                 for idx, length in enumerate(curr_lengths):
                     orig_idx = curr_orig_indices[idx]
-                    ge_list.append(all_ge[orig_idx].expand(-1, length))
-                    phones2_list.append(torch.LongTensor(all_phones2[orig_idx]).to(self.tts_config.device))
-                    phone_lens.append(len(all_phones2[orig_idx]))
+                    ge_list.append(inp.all_ge[orig_idx].expand(-1, length))
+                    phones2_list.append(torch.LongTensor(inp.all_phones2[orig_idx]).to(self.tts_config.device))
+                    phone_lens.append(len(inp.all_phones2[orig_idx]))
                 
                 curr_ge = torch.cat(ge_list, dim=1).unsqueeze(0)
                 curr_semantic = torch.cat(semantic_list).unsqueeze(0).unsqueeze(0)
@@ -762,8 +825,8 @@ class TTS:
                 slice_indices = torch.repeat_interleave(pairs, curr_lengths * 2, dim=0)
 
                 curr_word2ph = {
-                    "word": [w for idx in curr_orig_indices for w in all_word2ph[idx]["word"]],
-                    "ph": [p for idx in curr_orig_indices for p in all_word2ph[idx]["ph"]]
+                    "word": [w for idx in curr_orig_indices for w in inp.all_word2ph[idx]["word"]],
+                    "ph": [p for idx in curr_orig_indices for p in inp.all_word2ph[idx]["ph"]]
                 }
 
                 # ge [B, D, T]
@@ -793,7 +856,7 @@ class TTS:
                 if return_subtitles:
                     last_i = 0
                     for j in range(len(semantic_list)):
-                        best_i = self._find_subtitles(subtitles, all_word2ph[curr_orig_indices[j]], last_i)
+                        best_i = self._find_subtitles(subtitles, inp.all_word2ph[curr_orig_indices[j]], last_i)
                         subtitle = subtitles[last_i:best_i]
                         last_i = best_i
                         
@@ -808,7 +871,7 @@ class TTS:
                         subtitle[0]["start_s"] += head_offset / self.samplerate
                         subtitle[-1]["end_s"] -= tail_offset / self.samplerate
 
-                        subtitle = sub2text_index(subtitle, all_norm_text[curr_orig_indices[j]], texts[curr_orig_indices[j]])
+                        subtitle = sub2text_index(subtitle, inp.all_norm_text[curr_orig_indices[j]], inp.texts[curr_orig_indices[j]])
 
                         generated_audios.append(audio)
                         generated_subtitles.append(subtitle)
@@ -835,19 +898,19 @@ class TTS:
                     ordered_subtitles[original_pos] = generated_subtitles[current_pos]
 
             last_orig_idx = None
-            final_ordered_audios = [[] for _ in range(n_orig)]
-            final_ordered_subtitles = [[] for _ in range(n_orig)]
+            final_ordered_audios = [[] for _ in range(inp.n_orig)]
+            final_ordered_subtitles = [[] for _ in range(inp.n_orig)]
             for i, (audio_data, subtitle) in enumerate(zip(ordered_audios, ordered_subtitles)):
-                orig_idx = segment_to_original_map[i]
+                orig_idx = inp.segment_to_original_map[i]
                 final_ordered_audios[orig_idx].append(audio_data)
 
-                if texts[i][-1] in cut_mute_scale_map:
-                    cut_mute_scale = cut_mute_scale_map[texts[i][-1]]
-                elif "…" in cut_mute_scale_map and texts[i][-3:] in ["...", "。。。"]:
-                    cut_mute_scale = cut_mute_scale_map["…"]
+                if inp.texts[i][-1] in inp.cut_mute_scale_map:
+                    cut_mute_scale = inp.cut_mute_scale_map[inp.texts[i][-1]]
+                elif "…" in inp.cut_mute_scale_map and inp.texts[i][-3:] in ["...", "。。。"]:
+                    cut_mute_scale = inp.cut_mute_scale_map["…"]
                 else:
                     cut_mute_scale = 1.0
-                silence = np.zeros((int(cut_mute * cut_mute_scale * self.samplerate),), dtype=audio_data.dtype)
+                silence = np.zeros((int(inp.cut_mute * cut_mute_scale * self.samplerate),), dtype=audio_data.dtype)
                 final_ordered_audios[orig_idx].append(silence)
 
                 if return_subtitles:
@@ -855,14 +918,14 @@ class TTS:
                         cur_text_l = 0
                         last_orig_idx = orig_idx
 
-                    subtitle[-1]["end_s"] += cut_mute * cut_mute_scale
+                    subtitle[-1]["end_s"] += inp.cut_mute * cut_mute_scale
                     self._increment_subtitle_indices(subtitle, cur_text_l)
                     final_ordered_subtitles[orig_idx].append(subtitle)
 
-                    cur_text_l += len(texts[i])
+                    cur_text_l += len(inp.texts[i])
             
             result = []
-            for audio_list, subtitles_list, orig_text in zip(final_ordered_audios, final_ordered_subtitles, orig_texts):
+            for audio_list, subtitles_list, orig_text in zip(final_ordered_audios, final_ordered_subtitles, inp.orig_texts):
                 audio = np.concatenate(audio_list)
                 audio_len_s = len(audio) / self.samplerate
                 
