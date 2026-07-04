@@ -50,6 +50,10 @@ asr = None
 temp_dir = tempfile.mkdtemp(prefix="gsv_tts_personal_")
 use_asr_flag = True
 
+# Module-level default for models_dir — allow overriding via env var or __main__
+_models_dir_raw = os.environ.get("GSV_MODELS_DIR", "models")
+models_dir = Path(_models_dir_raw) if _models_dir_raw else project_root / "models"
+
 
 def is_url(path: str) -> bool:
     return path.startswith("http://") or path.startswith("https://")
@@ -748,10 +752,15 @@ async def tts_batched(request: TTSBatchedRequest):
 @app.get("/audio/{filename}")
 async def get_audio(filename: str):
     """获取生成的音频文件"""
-    file_path = output_dir / filename
+    file_path = (output_dir / filename).resolve()
+    # Prevent path traversal
+    if not str(file_path).startswith(str(output_dir.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件未找到")
-    return FileResponse(file_path, media_type="audio/wav")
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail="Not a file")
+    return FileResponse(str(file_path), media_type="audio/wav")
 
 
 if __name__ == "__main__":
@@ -761,6 +770,6 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--port", type=int, default=9880, help="server port")
     parser.add_argument("--use_asr", action="store_true", help="使用ASR自动识别音频文本")
     args = parser.parse_args()
-    models_dir = args.models_dir
+    models_dir = Path(args.models_dir)
     use_asr_flag = args.use_asr
     uvicorn.run(app, host="0.0.0.0", port=args.port)
