@@ -5,7 +5,6 @@ import wordsegment
 from .g2p_en import G2p
 from ..Pause import escaped_pause
 
-from builtins import str as unicode
 from .Normalization.expend import normalize
 from nltk.tokenize import TweetTokenizer
 import nltk
