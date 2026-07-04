@@ -18,11 +18,14 @@ def get_semantic_length(text, en_weight=1.75):
 def cut_text(text, cut_minlen=10):
     sentences = seg.segment(text)
 
-    for i in text:
-        if i == '\n':
-            sentences[0] = '\n'+sentences[0]
+    leading_newlines = 0
+    for ch in text:
+        if ch == '\n':
+            leading_newlines += 1
         else:
             break
+    if leading_newlines > 0:
+        sentences[0] = '\n' * leading_newlines + sentences[0]
     
     text_cuts = []
     punds_pattern = r'([，,；;：:、~・…]+|[\.。]{2,})'
@@ -175,6 +178,7 @@ def linear_interpolate(indices):
     
     if not valid_points: return result 
 
+    # Fill before first valid point with forward-extrapolation from 0
     first_idx, first_val = valid_points[0]
     
     if first_idx > 0:
@@ -194,9 +198,10 @@ def linear_interpolate(indices):
             interpolated_val = val_start + (val_diff / steps) * i
             result[idx_start + i] = int(round(interpolated_val))
 
+    # Fill after last valid point with last valid value (don't extrapolate)
     last_idx, last_val = valid_points[-1]
     for i in range(last_idx + 1, n):
-        result[i] = last_val + (i - last_idx)
+        result[i] = last_val
 
     return result
 
