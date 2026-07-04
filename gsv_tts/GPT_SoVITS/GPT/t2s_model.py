@@ -9,26 +9,13 @@ from tqdm import tqdm
 
 from .utils import sample
 from .embedding import SinePositionalEmbedding, TokenEmbedding
+from .t2s_base import (
+    _T2SBlockBase, _T2STransformerBase, _BucketBase, Text2SemanticDecoderBase,
+)
 
 
-class T2SBlock(nn.Module):
-    def __init__(self, hidden_dim, num_heads, mlp_ratio=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.hidden_dim = hidden_dim
-        self.head_dim = hidden_dim // num_heads
-        
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim * mlp_ratio, hidden_dim)
-        )
-    
+class T2SBlock(_T2SBlockBase):
+
     def process_prompt(
         self,
         x: torch.Tensor,
@@ -106,26 +93,7 @@ class T2SBlock(nn.Module):
         return x
 
 
-class T2STransformer(nn.Module):
-    def __init__(self, num_blocks: int, blocks: List[T2SBlock]):
-        super().__init__()
-        self.num_blocks: int = num_blocks
-        self.blocks = nn.ModuleList(blocks)
-
-    def process_prompt(
-        self,
-        x: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        kv_cache_len: torch.Tensor,
-        attn_mask: torch.Tensor
-    ):
-        for i in range(self.num_blocks):
-            x = self.blocks[i].process_prompt(
-                x, k_cache[i], v_cache[i], attn_mask
-            )
-        kv_cache_len.fill_(x.shape[1])
-        return x
+class T2STransformer(_T2STransformerBase):
 
     def decode_next_token(
         self,
@@ -144,69 +112,26 @@ class T2STransformer(nn.Module):
         return x
 
 
-class Bucket:
-    cuda_graph = None  # 改为通用类型，支持 None 或非 CUDA 设备
-    graph_xy_pos: torch.Tensor = None
-    graph_xy_dec: torch.Tensor = None
-    kv_cache_len: torch.Tensor = None
-    k_cache: torch.Tensor = None
-    v_cache: torch.Tensor = None
+class Bucket(_BucketBase):
     decode_attn_mask: torch.Tensor = None
-    max_kv_cache: int = None
-    batch_size: int = None
     batch_indices: int = None
 
-class Text2SemanticDecoder(nn.Module):
+class Text2SemanticDecoder(Text2SemanticDecoderBase):
+    """Standard SDPA implementation of GPT T2S decoder."""
+
+    def _build_t2s_block(self, hidden_dim, num_heads):
+        return T2SBlock(hidden_dim, num_heads)
+
     def __init__(self, config):
-        super(Text2SemanticDecoder, self).__init__()
-        self.model_dim = config["model"]["hidden_dim"]
-        self.embedding_dim = config["model"]["embedding_dim"]
-        self.num_head = config["model"]["head"]
-        self.num_layers = config["model"]["n_layer"]
-        self.vocab_size = config["model"]["vocab_size"]
-        self.phoneme_vocab_size = config["model"]["phoneme_vocab_size"]
-        self.p_dropout = config["model"]["dropout"]
-        self.EOS = config["model"]["EOS"]
+        super().__init__(config)
+        # Re-wrap blocks with the correct T2STransformer subtype (base used
+        # _T2STransformerBase; we need T2STransformer's decode_next_token).
+        self.t2s_transformer = T2STransformer(
+            self.num_layers, list(self.t2s_transformer.blocks))
 
-        self.suppressed_tokens = [280, 486, self.EOS]
-
-        self.bert_proj = nn.Linear(1024, self.embedding_dim)
-        self.ar_text_embedding = TokenEmbedding(
-            self.embedding_dim,
-            self.phoneme_vocab_size,
-            self.p_dropout,
-        )
-        self.ar_text_position = SinePositionalEmbedding(
-            self.embedding_dim,
-            dropout=0.1,
-            scale=False,
-            alpha=True,
-        )
-        self.ar_audio_embedding = TokenEmbedding(
-            self.embedding_dim,
-            self.vocab_size,
-            self.p_dropout,
-        )
-        self.ar_audio_position = SinePositionalEmbedding(
-            self.embedding_dim,
-            dropout=0.1,
-            scale=False,
-            alpha=True,
-        )
-
-        self.ar_predict_layer = nn.Linear(self.model_dim, self.vocab_size, bias=False)
-
-        blocks = []
-        for i in range(self.num_layers):
-            block = T2SBlock(
-                self.model_dim,
-                self.num_head,
-            )
-            blocks.append(block)
-
-        self.t2s_transformer = T2STransformer(self.num_layers, blocks)
-
-        self.cuda_graph_buckets = {}
+    # Public aliases for methods called by inference code
+    def process_batch_data(self, x, y, bert_feature, x_lens, y_lens):
+        return self._process_batch_data(x, y, bert_feature, x_lens, y_lens)
     
     @torch.inference_mode()
     def initialize_runtime(self, dtype, device, gpt_cache):
@@ -298,99 +223,6 @@ class Text2SemanticDecoder(nn.Module):
         if use_cuda_graph:
             torch.cuda.current_stream().wait_stream(s)
     
-    def process_batch_data(self, x, y, bert_feature, x_lens, y_lens):
-        device = x.device
-        B = x.shape[0]
-
-        xy_lens = x_lens + y_lens
-
-        xy_len = xy_lens.max()
-        x_len = x_lens.max()
-        y_len = y_lens.max()
-
-        xy_indices = torch.arange(xy_len, device=device).unsqueeze(0)
-        x_mask1 = xy_indices < x_lens
-        indices = torch.arange(x_len, device=device)
-        x_mask2 = indices.unsqueeze(0) < x_lens
-
-        y_mask1 = (x_lens <= xy_indices) & (xy_indices < xy_lens)
-        indices = torch.arange(y_len, device=device).unsqueeze(0)
-        y_mask2 = indices < y_lens
-
-        last_token_mask = xy_indices == xy_lens - 1
-
-
-        x = self.ar_text_embedding(x)
-        x = x + self.bert_proj(bert_feature)
-        x = self.ar_text_position(x)
-
-        y_emb = self.ar_audio_embedding(y)
-        y_pos = self.ar_audio_position(y_emb)
-
-        xy_pos = torch.zeros((B, xy_len, self.model_dim), dtype=y_pos.dtype, device=device)
-        xy_pos[x_mask1] = x[x_mask2]
-        xy_pos[y_mask1] = y_pos[y_mask2]
-
-
-        # 音素可以关注自身(双向),但不能关注音频 音频可以关注自身(因果),也能关注音素(双向)
-        prompt_attn_mask = torch.zeros((B, xy_len, xy_len), dtype=torch.bool, device=device)
-
-        x_attn_mask = x_mask1.unsqueeze(1).expand(-1, x_len, -1).clone()
-        prompt_attn_mask[x_mask1] = x_attn_mask[x_mask2]
-
-        y_attn_mask = x_mask1.unsqueeze(1).expand(-1, y_len, -1).clone()
-        tril_mask = torch.tril(torch.ones(B, y_len, xy_len, dtype=torch.bool, device=device))
-        mask = xy_indices < (xy_len - x_lens)
-        mask = mask.unsqueeze(1).expand(-1, y_len, -1)
-        y_attn_mask[~y_attn_mask] = tril_mask[mask]
-        prompt_attn_mask[y_mask1] = y_attn_mask[y_mask2]
-
-        prompt_attn_mask = prompt_attn_mask.unsqueeze(1).expand(-1, self.num_head, -1, -1)
-        # PyTorch F.scaled_dot_product_attention bool mask convention:
-        #   True  = MASK this position (do NOT attend)
-        #   False = allow attention
-        # Our construction uses True = "can attend", so invert.
-        prompt_attn_mask = ~prompt_attn_mask
-
-        return xy_pos, last_token_mask, prompt_attn_mask
-
-    def process_single_data(self, x, y, bert_feature):
-        x_len = x.shape[1]
-        x = self.ar_text_embedding(x)
-        x = x + self.bert_proj(bert_feature)
-        x = self.ar_text_position(x)
-
-        y_len = y.shape[1]
-        y_emb = self.ar_audio_embedding(y)
-        y_pos = self.ar_audio_position(y_emb)
-
-        xy_pos = torch.concat([x, y_pos], dim=1)
-
-        B, device = x.shape[0], x.device
-
-        # 音素可以关注自身(双向),但不能关注音频 音频可以关注自身(因果),也能关注音素(双向)
-        x_attn_mask = F.pad(
-            torch.ones((x_len, x_len), dtype=torch.bool),
-            (0, y_len),
-            value=False,
-        )
-        y_attn_mask = F.pad(
-            torch.tril(torch.ones((y_len, y_len), dtype=torch.bool)),
-            (x_len, 0),
-            value=True,
-        )
-        prompt_attn_mask = (
-            torch.concat([x_attn_mask, y_attn_mask], dim=0)
-            .unsqueeze(0).unsqueeze(0)
-            .expand(B, self.num_head, -1, -1)
-            .to(device=device, dtype=torch.bool)
-        )
-        # PyTorch convention: True = mask (do NOT attend). Our construction
-        # uses True = "can attend", so invert.
-        prompt_attn_mask = ~prompt_attn_mask
-        
-        return xy_pos, prompt_attn_mask
-
     @torch.inference_mode()
     def infer(
         self,
