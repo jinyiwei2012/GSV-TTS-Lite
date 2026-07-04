@@ -1,7 +1,26 @@
+"""GPU auto-detection and configuration for GSV-TTS-Lite.
+
+Device/dtype selection is cached on first access so that ``import Config`` does
+not immediately initialise CUDA (useful when the module is imported for
+documentation or introspection).
+"""
+
+import os
+import logging
 import torch
 
-def get_cuda_device_info(idx: int):
-    """获取 CUDA 设备信息"""
+# -----------------------------------------------------------
+# Named constants for SM version thresholds
+# -----------------------------------------------------------
+SM_AMPERE_MIN = 8.0    # Ampere+ (A100, A6000, RTX 30xx): bfloat16
+SM_TURING_MIN = 7.0    # Turing/Volta (T4, V100, RTX 20xx): float16
+SM_PASCAL     = 6.1    # Pascal (P100, GTX 10xx): float32
+SM_MIN_SUPPORTED = 5.3  # Minimum CUDA capability we support
+FULLWIDTH_OFFSET = 0xFEE0
+
+
+def get_cuda_device_info(idx: int, quiet: bool = False):
+    """Get CUDA device info for a GPU at *idx*."""
     if not torch.cuda.is_available() or idx >= torch.cuda.device_count():
         return None
 
@@ -13,96 +32,131 @@ def get_cuda_device_info(idx: int):
     name = props.name
     major, minor = props.major, props.minor
     sm_version = major + minor / 10.0
-    mem_gb = props.total_memory / (1024**3)
+    mem_gb = props.total_memory / (1024 ** 3)
 
-    if sm_version < 5.3:
+    if sm_version < SM_MIN_SUPPORTED:
+        if not quiet:
+            logging.info(
+                "GPU %d (%s) SM %.1f below minimum %.1f, skipping",
+                idx, name, sm_version, SM_MIN_SUPPORTED,
+            )
         return None
 
     device = torch.device(f"cuda:{idx}")
 
-    # 针对旧架构或特殊系列强制使用 float32
+    # GTX 16 series (Turing SM 7.5 but lacking tensor-core float16 perf)
     is_16_series = (major == 7 and minor == 5) and ("16" in name)
-    if sm_version == 6.1 or is_16_series:
+
+    if sm_version == SM_PASCAL or is_16_series:
         return device, torch.float32, sm_version, mem_gb
 
-    # 针对 Ampere (sm 8.0) 及以上架构，优先使用 bfloat16
-    if sm_version >= 8.0:
+    if sm_version >= SM_AMPERE_MIN:
         return device, torch.bfloat16, sm_version, mem_gb
 
-    # 针对 Volta (sm 7.0) 和 Turing (sm 7.5，除16系列外) 使用 float16
-    if sm_version >= 7.0:
+    if sm_version >= SM_TURING_MIN:
         return device, torch.float16, sm_version, mem_gb
 
-    # 其他情况兜底使用 float32
     return device, torch.float32, sm_version, mem_gb
 
+
 def get_mps_device_info():
-    """获取 Apple Silicon MPS 设备信息"""
+    """Get Apple Silicon MPS device info."""
     if not torch.backends.mps.is_available():
         return None
-
     try:
-        # MPS 设备
         device = torch.device("mps")
-        # Apple Silicon 上 MPS 使用 float32 更稳定
-        # 虽然 MPS 支持 float16，但在某些模型上可能有精度问题
-        return device, torch.float32, 0.0, 0.0  # sm_version 和 mem_gb 对 MPS 不适用
+        return device, torch.float32, 0.0, 0.0
     except Exception:
         return None
 
 
-# 检测设备类型和配置
-device = None
-dtype = None
+# -----------------------------------------------------------
+# Cached lazy device / dtype detection
+# -----------------------------------------------------------
+_DEVICE_CACHE: torch.device | None = None
+_DTYPE_CACHE: torch.dtype | None = None
 
-# 优先尝试 CUDA
-if torch.cuda.is_available():
-    GPU_COUNT = torch.cuda.device_count()
-    available_devices = []
-    for i in range(GPU_COUNT):
-        info = get_cuda_device_info(i)
-        if info is not None:
-            available_devices.append(info)
 
-    if available_devices:
-        best_info = max(available_devices, key=lambda x: (x[2], x[3]))
-        device = best_info[0]
-        dtype = best_info[1]
+def _detect_device() -> torch.device:
+    """Run full device detection (called once, cache on first access)."""
+    # CUDA
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        available_devices = []
+        for i in range(gpu_count):
+            info = get_cuda_device_info(i)
+            if info is not None:
+                available_devices.append(info)
+        if available_devices:
+            # Prefer highest SM version, then most memory
+            best = max(available_devices, key=lambda x: (x[2], x[3]))
+            global _DTYPE_CACHE
+            _DTYPE_CACHE = best[1]
+            return best[0]
 
-# 如果没有 CUDA，尝试 MPS (Apple Silicon)
-if device is None:
-    mps_info = get_mps_device_info()
-    if mps_info is not None:
-        device = mps_info[0]
-        dtype = torch.float32  # MPS 使用 float32
+    # MPS (Apple Silicon)
+    mps = get_mps_device_info()
+    if mps is not None:
+        global _DTYPE_CACHE
+        _DTYPE_CACHE = torch.float32
+        return mps[0]
 
-# 如果没有可用的 GPU，使用 CPU
-if device is None:
-    device = torch.device("cpu")
-    dtype = torch.float32  # CPU 使用 float32
+    # CPU fallback
+    _DTYPE_CACHE = torch.float32
+    return torch.device("cpu")
 
+
+def get_device() -> torch.device:
+    """Return best available device (cached on first call)."""
+    global _DEVICE_CACHE
+    if _DEVICE_CACHE is None:
+        _DEVICE_CACHE = _detect_device()
+    return _DEVICE_CACHE
+
+
+def get_dtype() -> torch.dtype:
+    """Return best dtype for the detected device (cached on first call)."""
+    global _DTYPE_CACHE
+    if _DTYPE_CACHE is None:
+        _detect_device()
+    return _DTYPE_CACHE
+
+
+# Backward-compatible module-level aliases — lazily populated so that
+# ``import Config`` does not immediately probe CUDA.
+_device: torch.device | None = None
+_dtype: torch.dtype | None = None
+
+
+def _lazy_init():
+    global _device, _dtype
+    if _device is None:
+        _device = get_device()
+    if _dtype is None:
+        _dtype = get_dtype()
+    return _device, _dtype
+
+
+# -----------------------------------------------------------
+# Config classes
+# -----------------------------------------------------------
 
 class Config:
     def __init__(self):
-        self.dtype = dtype
-        self.device = device
-
-        self.use_flash_attn = True
-
-        self.gpt_cache = None
-        self.sovits_cache = None
-
-        self.cnroberta = None
+        dev, dt = _lazy_init()
+        self.dtype = dt
+        self.device = dev
 
 
 class GlobalConfig:
+    """Holds global path and G2P-module state (separate from device config)."""
+
     def __init__(self):
         self.models_dir = None
-
         self.use_jieba_fast = None
-
         self.chinese_g2p = None
         self.japanese_g2p = None
         self.english_g2p = None
+
 
 global_config = GlobalConfig()
