@@ -36,6 +36,13 @@ from .GPT_SoVITS.G2P import Pause
 
 
 class TTS:
+    # Default mute scale map — class constant to avoid mutable default anti-pattern
+    _CUT_MUTE_SCALE_MAP: dict[str, float] = {
+        "…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5,
+        "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0,
+        ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8,
+    }
+
     def __init__(
         self,
         gpt_cache: list[tuple[int, int]] = [(1, 512), (1, 768), (1, 1024), (4, 512), (4, 1024)],
@@ -303,7 +310,7 @@ class TTS:
         is_cut_text: bool = True,
         cut_minlen: int = 10,
         cut_mute: int = 0.4,
-        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8},
+        cut_mute_scale_map: dict[str, float] | None = None,
         stream_mode: Literal["token", "sentence"] = "token",
         stream_chunk: int = 25,
         overlap_len: int = 5,
@@ -377,6 +384,8 @@ class TTS:
             if not is_cut_text: cut_minlen = 10000
             if speed <= 0:
                 raise ValueError(f"speed must be positive, got {speed}")
+            if cut_mute_scale_map is None:
+                cut_mute_scale_map = self._CUT_MUTE_SCALE_MAP
             cut_mute = cut_mute / speed
 
             if gpt_model is None:
@@ -529,7 +538,7 @@ class TTS:
         is_cut_text: bool = True,
         cut_minlen: int = 10,
         cut_mute: int = 0.4,
-        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8},
+        cut_mute_scale_map: dict[str, float] | None = None,
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
@@ -594,6 +603,8 @@ class TTS:
             if not is_cut_text: cut_minlen = 10000
             if speed <= 0:
                 raise ValueError(f"speed must be positive, got {speed}")
+            if cut_mute_scale_map is None:
+                cut_mute_scale_map = self._CUT_MUTE_SCALE_MAP
             cut_mute = cut_mute / speed
 
             n = len(texts)
@@ -1053,7 +1064,7 @@ class TTS:
         is_cut_text: bool = True,
         cut_minlen: int = 10,
         cut_mute: int = 0.4,
-        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8},
+        cut_mute_scale_map: dict[str, float] | None = None,
         stream_mode: Literal["token", "sentence"] = "token",
         stream_chunk: int = 25,
         overlap_len: int = 5,
@@ -1134,7 +1145,7 @@ class TTS:
         is_cut_text: bool = True,
         cut_minlen: int = 10,
         cut_mute: int = 0.4,
-        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 1.0, "，": 1.0, ":": 1.0, "：": 1.0, ";": 1.0, "；": 1.0, "~": 1.0, "、": 0.8, "・": 0.8},
+        cut_mute_scale_map: dict[str, float] | None = None,
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
