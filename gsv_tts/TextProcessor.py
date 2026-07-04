@@ -2,12 +2,21 @@ import re
 import torch
 import pysbd
 import bisect
+import logging
 
 from .Config import Config
 from .LangSegment import LangSegment
 from .GPT_SoVITS.G2P import phonemes_to_ids, text_to_phonemes
 
-seg = pysbd.Segmenter()
+_segmenter: pysbd.Segmenter | None = None
+
+
+def _get_segmenter() -> pysbd.Segmenter:
+    """Lazy-initialize pysbd segmenter (avoids import-time overhead)."""
+    global _segmenter
+    if _segmenter is None:
+        _segmenter = pysbd.Segmenter(language="zh", clean=False)
+    return _segmenter
 
 
 def get_semantic_length(text, en_weight=1.75):
@@ -16,7 +25,7 @@ def get_semantic_length(text, en_weight=1.75):
     return cjk_count + (en_count * en_weight)
 
 def cut_text(text, cut_minlen=10):
-    sentences = seg.segment(text)
+    sentences = _get_segmenter().segment(text)
 
     leading_newlines = 0
     for ch in text:
@@ -210,8 +219,14 @@ def sub2text_index(subtitles, norm_text: str, orig_text: str):
     sub_norm_idx = []
     for subtitle in subtitles:
         text = subtitle['text']
-        idx = norm_text.find(text, idx)
-        sub_norm_idx.append({"start":idx, "end":idx+len(text)-1})
+        found = norm_text.find(text, idx)
+        if found == -1:
+            logging.warning(
+                f"Subtitle text not found in normalized text: '{text[:50]}...'"
+            )
+            found = max(0, idx)  # Fall back to current position
+        idx = found
+        sub_norm_idx.append({"start": idx, "end": idx + len(text) - 1})
 
     orig_split_text = split_text(orig_text)
     norm_split_text = split_text(norm_text)
