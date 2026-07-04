@@ -11,6 +11,14 @@ from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 
 pcs = set()
 
+_ALLOWED_INFER_PARAMS = frozenset({
+    "text", "spk_audio_path", "prompt_audio_path", "prompt_audio_text",
+    "stream_chunk", "overlap_len", "speed", "language", "is_cut_text",
+    "cut_minlen", "cut_mute", "cut_mute_scale_map", "top_k", "top_p",
+    "temperature", "repetition_penalty", "noise_scale", "stream_mode",
+    "boost_first_chunk", "return_subtitles", "debug",
+})
+
 class AudioTrack(MediaStreamTrack):
     # WebRTC 协商的默认音频参数通常是 48kHz, 双声道, 16位
     kind = "audio"
@@ -95,11 +103,20 @@ async def handle_offer(request):
 
         @channel.on("message")
         def on_message(message):
-            data = json.loads(message)
+            if not isinstance(message, str):
+                return
+
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                logging.error("Invalid JSON received")
+                return
+
+            filtered_data = {k: v for k, v in data.items() if k in _ALLOWED_INFER_PARAMS}
 
             async def generate():
                 try:
-                    async for clip in tts.infer_stream_async(**data):
+                    async for clip in tts.infer_stream_async(**filtered_data):
                         await audio_track.put_audio(clip)
                     channel.send(json.dumps({"status": "ok"}))
                 except Exception as e:

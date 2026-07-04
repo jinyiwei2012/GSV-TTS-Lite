@@ -106,7 +106,10 @@ def get_sovits_weights(sovits_path, tts_config: Config):
         dict_s2, version = load_sovits(sovits_path)
         
         hps = utils.DictToAttrRecursive(dict_s2["config"])
-        hps.model.semantic_frame_rate = "25hz"
+        # Read frame rate from model config; fall back to "25hz" for compatibility
+        hps.model.semantic_frame_rate = getattr(
+            hps.model, "semantic_frame_rate", None
+        ) or "25hz"
         if version is None:
             supported = ["v2", "v2Pro", "v2ProPlus"]
             detected = getattr(hps.model, 'version', None)
