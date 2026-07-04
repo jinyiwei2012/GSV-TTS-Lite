@@ -608,33 +608,46 @@ async def tts_stream(request: TTSStreamRequest):
         async def generate():
             try:
                 loop = asyncio.get_running_loop()
-                
+                chunk_queue: asyncio.Queue = asyncio.Queue()
+
                 def stream_infer():
-                    return list(tts.infer_stream(
-                        spk_audio_path=final_speaker_audio,
-                        prompt_audio_path=final_prompt_audio,
-                        prompt_audio_text=final_prompt_text,
-                        text=request.text,
-                        is_cut_text=request.is_cut_text,
-                        cut_minlen=request.cut_minlen,
-                        cut_mute=request.cut_mute,
-                        stream_mode=request.stream_mode,
-                        stream_chunk=request.stream_chunk,
-                        overlap_len=request.overlap_len,
-                        boost_first_chunk=request.boost_first_chunk,
-                        top_k=request.top_k,
-                        top_p=request.top_p,
-                        temperature=request.temperature,
-                        repetition_penalty=request.repetition_penalty,
-                        noise_scale=request.noise_scale,
-                        speed=request.speed,
-                        debug=False,
-                    ))
-                
-                clips = await loop.run_in_executor(None, stream_infer)
-                
+                    """Run inference in thread, put each chunk into async queue."""
+                    try:
+                        for clip in tts.infer_stream(
+                            spk_audio_path=final_speaker_audio,
+                            prompt_audio_path=final_prompt_audio,
+                            prompt_audio_text=final_prompt_text,
+                            text=request.text,
+                            is_cut_text=request.is_cut_text,
+                            cut_minlen=request.cut_minlen,
+                            cut_mute=request.cut_mute,
+                            stream_mode=request.stream_mode,
+                            stream_chunk=request.stream_chunk,
+                            overlap_len=request.overlap_len,
+                            boost_first_chunk=request.boost_first_chunk,
+                            top_k=request.top_k,
+                            top_p=request.top_p,
+                            temperature=request.temperature,
+                            repetition_penalty=request.repetition_penalty,
+                            noise_scale=request.noise_scale,
+                            speed=request.speed,
+                            debug=False,
+                        ):
+                            loop.call_soon_threadsafe(chunk_queue.put_nowait, clip)
+                    except Exception as e:
+                        loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+                    finally:
+                        loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+                loop.run_in_executor(None, stream_infer)
+
                 total_len = 0
-                for clip in clips:
+                while True:
+                    clip = await chunk_queue.get()
+                    if clip is None:
+                        break
+                    if isinstance(clip, Exception):
+                        raise clip
                     audio_bytes = clip.audio_data.tobytes()
                     audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
                     
