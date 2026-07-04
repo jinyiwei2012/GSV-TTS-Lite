@@ -1,6 +1,7 @@
 from typing import List
 
 import torch
+import logging
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
@@ -247,7 +248,7 @@ class Text2SemanticDecoder(nn.Module):
             decode_attn_mask_root = torch.zeros(max_elem * self.num_head, dtype=torch.bool, device=device)
 
             KV_CACHE_LEN = torch.zeros((max_btz,), dtype=torch.int64, device=device)
-            GRAPH_XY_POS = torch.zeros((max_btz, 1, self.model_dim), dtype=dtype, device=device)
+            GRAPH_XY_POS = torch.zeros((max_btz, 1, self.embedding_dim), dtype=dtype, device=device)
 
             for batch_size in self.cuda_graph_buckets:
                 BATCH_IDX = torch.arange(batch_size, dtype=torch.int64, device=device)
@@ -425,7 +426,8 @@ class Text2SemanticDecoder(nn.Module):
         samples = sample(logits[:, :-1], pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
         pre_tokens = torch.concat([pre_tokens, samples], dim=1)
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
+        pe_idx = min(max(0, bucket.kv_cache_len - x.shape[1]), pe_cache.shape[0] - 1)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[pe_idx]
 
         max_bucket.decode_attn_mask.fill_(False)
         bucket.decode_attn_mask[:, :, :, :bucket.kv_cache_len] = True
@@ -433,6 +435,12 @@ class Text2SemanticDecoder(nn.Module):
         for idx in tqdm(range(1, max_bucket.max_kv_cache - bucket.kv_cache_len + 1)):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
+                if bucket_i >= len(buckets):
+                    logging.warning(
+                        f"Generated sequence exceeds max cache size "
+                        f"({bucket.max_kv_cache}). Truncating."
+                    )
+                    break
                 bucket: Bucket = buckets[bucket_i]
 
             bucket.decode_attn_mask[:, :, :, bucket.kv_cache_len] = True
@@ -461,7 +469,8 @@ class Text2SemanticDecoder(nn.Module):
                     break
 
             y_emb = self.ar_audio_embedding(samples)
-            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
+            pe_idx = min(max(0, bucket.kv_cache_len - x.shape[1]), pe_cache.shape[0] - 1)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[pe_idx]
 
         pre_tokens = pre_tokens[:, -idx:]
         eos_indices = (pre_tokens == self.EOS).nonzero(as_tuple=True)[1]
@@ -508,7 +517,8 @@ class Text2SemanticDecoder(nn.Module):
         samples = sample(logits[:, :-1], pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
         pre_tokens = torch.concat([pre_tokens, samples], dim=1)
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
+        pe_idx = min(max(0, bucket.kv_cache_len - x.shape[1]), pe_cache.shape[0] - 1)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[pe_idx]
 
         max_bucket.decode_attn_mask.fill_(False)
         bucket.decode_attn_mask[:, :, :, :bucket.kv_cache_len] = True
@@ -518,6 +528,12 @@ class Text2SemanticDecoder(nn.Module):
         for idx in tqdm(range(1, max_bucket.max_kv_cache - bucket.kv_cache_len + 1), disable=not debug):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
+                if bucket_i >= len(buckets):
+                    logging.warning(
+                        f"Generated sequence exceeds max cache size "
+                        f"({bucket.max_kv_cache}). Truncating."
+                    )
+                    break
                 bucket: Bucket = buckets[bucket_i]
             
             bucket.decode_attn_mask[:, :, :, bucket.kv_cache_len] = True
@@ -556,7 +572,8 @@ class Text2SemanticDecoder(nn.Module):
                         pre_chunk = None
 
             y_emb = self.ar_audio_embedding(samples)
-            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
+            pe_idx = min(max(0, bucket.kv_cache_len - x.shape[1]), pe_cache.shape[0] - 1)
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[pe_idx]
 
         yield pre_tokens[:, -idx:].unsqueeze(0), True
     
