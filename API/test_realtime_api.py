@@ -16,6 +16,7 @@ SOVITS_MODEL = r"C:\baidunetdiskdownload\洛琪希GSV模型\洛琪希.pth"
 
 # 尝试初始化音频播放器
 audio_stream = None
+p = None
 try:
     import pyaudio
     p = pyaudio.PyAudio()
@@ -106,7 +107,8 @@ async def run_client():
     if audio_stream:
         audio_stream.stop_stream()
         audio_stream.close()
-        p.terminate()
+        if p is not None:
+            p.terminate()
     await pc.close()
 
 if __name__ == "__main__":

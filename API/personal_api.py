@@ -18,6 +18,7 @@ import uuid
 import wave
 from io import BytesIO
 from typing import Optional, Union, Any
+from contextlib import asynccontextmanager
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -39,8 +40,57 @@ logging.basicConfig(
 app = FastAPI(
     title="GSV-TTS 个人化应用 API",
     description="简单、功能全的TTS API，支持流式和批量两种推理模式",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan,
 )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown lifecycle for the FastAPI application."""
+    global tts, asr
+    print("正在加载 TTS 模型...")
+    
+    tts = TTS(
+        models_dir=models_dir,
+        sovits_cache=[50],
+    )
+    print("TTS 模型加载完成！")
+    
+    if use_asr_flag:
+        try:
+            import torch
+            from huggingface_hub import snapshot_download
+            
+            local_model_path = models_dir / "qwen3_asr"
+            repo_id = "Qwen/Qwen3-ASR-0.6B"
+            
+            if not (local_model_path.exists() and (local_model_path / "config.json").exists()):
+                print(f"本地未找到ASR模型，正在下载: {repo_id}")
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(local_model_path),
+                    local_dir_use_symlinks=False,
+                )
+                print("ASR模型下载完成！")
+            
+            from qwen_asr import Qwen3ASRModel
+            print("正在加载 ASR 模型...")
+            asr = Qwen3ASRModel.from_pretrained(
+                str(local_model_path),
+                dtype=torch.bfloat16,
+                device_map="cuda:0",
+                local_files_only=True
+            )
+            print("ASR 模型加载完成！")
+        except Exception as e:
+            print(f"ASR 模型加载失败: {e}")
+            print("提示：如果没有提供 prompt_text，请求将会失败")
+            asr = None
+    else:
+        print("ASR 模型已禁用")
+    
+    yield
+    # Shutdown: cleanup
 
 output_dir = project_root / "output"
 output_dir.mkdir(exist_ok=True)
@@ -411,51 +461,6 @@ class APIV2Request(BaseModel):
     overlap_length: int = 5
     min_chunk_length: int = 25
     batch_infer: bool = False
-
-
-@app.on_event("startup")
-async def startup_event():
-    global tts, asr
-    print("正在加载 TTS 模型...")
-    
-    tts = TTS(
-        models_dir=models_dir,
-        sovits_cache=[50],
-    )
-    print("TTS 模型加载完成！")
-    
-    if use_asr_flag:
-        try:
-            import torch
-            from huggingface_hub import snapshot_download
-            
-            local_model_path = models_dir / "qwen3_asr"
-            repo_id = "Qwen/Qwen3-ASR-0.6B"
-            
-            if not (local_model_path.exists() and (local_model_path / "config.json").exists()):
-                print(f"本地未找到ASR模型，正在下载: {repo_id}")
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(local_model_path),
-                    local_dir_use_symlinks=False,
-                )
-                print("ASR模型下载完成！")
-            
-            from qwen_asr import Qwen3ASRModel
-            print("正在加载 ASR 模型...")
-            asr = Qwen3ASRModel.from_pretrained(
-                str(local_model_path),
-                dtype=torch.bfloat16,
-                device_map="cuda:0",
-                local_files_only=True
-            )
-            print("ASR 模型加载完成！")
-        except Exception as e:
-            print(f"ASR 模型加载失败: {e}")
-            print("提示：如果没有提供 prompt_text，请求将会失败")
-            asr = None
-    else:
-        print("ASR 模型已禁用")
 
 
 @app.get("/")

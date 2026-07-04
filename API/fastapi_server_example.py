@@ -6,6 +6,7 @@ FastAPI 服务端使用示例
 
 import sys
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -20,11 +21,12 @@ import os
 import tempfile
 import logging
 
-app = FastAPI(title="GSV-TTS 异步 API", version="1.1")
+app = FastAPI(title="GSV-TTS 异步 API", version="1.1", lifespan=lifespan)
 
 models_dir = project_root / "API" / "models"
 output_dir = project_root / "output"
 output_dir.mkdir(exist_ok=True)
+AUDIO_DIR = output_dir.resolve()
 
 tts: Optional[TTS] = None
 multi_tts: Optional[MultiSpeakerTTS] = None
@@ -149,8 +151,9 @@ class MultiBatchRequest(BaseModel):
     """List of (speaker, text) pairs for multi-speaker batch inference."""
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown lifecycle for the FastAPI application."""
     global tts, asr
     print("🚀 正在加载 TTS 模型...")
     
@@ -203,6 +206,9 @@ async def startup_event():
             asr = None
     else:
         print("ℹ️ ASR 模型已禁用")
+    
+    yield
+    # Shutdown: cleanup resources if needed
 
 
 @app.get("/")
@@ -325,10 +331,14 @@ async def tts_batch(request: TTSBatchRequest):
 @app.get("/audio/{filename}")
 async def get_audio(filename: str):
     """获取生成的音频文件"""
-    file_path = output_dir / filename
+    file_path = (AUDIO_DIR / filename).resolve()
+    if not str(file_path).startswith(str(AUDIO_DIR)):
+        raise HTTPException(status_code=403, detail="Access denied")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件未找到")
-    return FileResponse(file_path, media_type="audio/wav")
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail="Not a file")
+    return FileResponse(str(file_path), media_type="audio/wav")
 
 
 # ============================================================
