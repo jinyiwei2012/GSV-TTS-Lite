@@ -47,10 +47,7 @@ class LangSegment():
 
     @staticmethod
     def _is_chinese(word):
-        for char in word:
-            if '\u4e00' <= char <= '\u9fff':
-                return True
-        return False
+        return bool(re.search(r'[\u4e00-\u9fff]', word))
     
     @staticmethod
     def _is_japanese_kana(word):
@@ -166,7 +163,7 @@ class LangSegment():
             nextText = lines[nextId] if not EOS else ""
             nextPunc = len(re.sub(regex_pattern,'',re.sub(r'\n+','',nextText)).strip()) == 0
             textPunc = len(re.sub(regex_pattern,'',re.sub(r'\n+','',text)).strip()) == 0
-            if not EOS and (textPunc == True or ( len(nextText.strip()) >= 0 and nextPunc == True)):
+            if not EOS and (textPunc or (len(nextText.strip()) >= 0 and nextPunc)):
                 lines[nextId] = f'{text}{nextText}'
                 continue
             number_tags = re.compile(r'(⑥\d{6,}⑥)')
