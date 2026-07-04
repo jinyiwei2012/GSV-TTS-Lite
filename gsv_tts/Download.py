@@ -7,10 +7,18 @@ from tqdm import tqdm
 from pathlib import Path
 
 
-base_url = None
+# Mirror selection — allow override via GSV_MIRROR env var
+#   "modelscope" → ModelScope (best for China)
+#   "huggingface" → Hugging Face (international)
+#   "hf-mirror" → hf-mirror.com (HF proxy for China)
+_MIRROR_OVERRIDE = os.environ.get("GSV_MIRROR", "")
 modelscope_base_url = "https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/%s"
 huggingface_base_url = "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/%s?download=true"
 hf_mirror_base_url = "https://hf-mirror.com/cnmds/GPTSoVITS-RT/resolve/main/%s?download=true"
+
+base_url = None
+
+_DEFAULT_TIMEOUT = 30  # seconds
 
 # Default GPT/SoVITS model files (not in pretrained_models zip)
 _DEFAULT_MODEL_FILES = [
@@ -19,34 +27,72 @@ _DEFAULT_MODEL_FILES = [
 ]
 
 
-def download_file(url, filename):
+def download_file(url, filename, timeout=_DEFAULT_TIMEOUT):
+    """Download a file with timeout, progress bar, and integrity check."""
     logging.info(f"Downloading model from {url}")
 
-    response = requests.get(url, stream=True)
+    try:
+        response = requests.get(url, stream=True, timeout=timeout)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logging.error(f"Download request failed for {url}: {e}")
+        return False
+
     total_size_in_bytes = int(response.headers.get('content-length', 0))
     block_size = 1024
-    progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
-    
-    with open(filename, 'wb') as file:
-        for data in response.iter_content(block_size):
-            progress_bar.update(len(data))
-            file.write(data)
-    progress_bar.close()
 
-    if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-        logging.error(f"ERROR: Download of {filename} incomplete or something went wrong. Expected {total_size_in_bytes} bytes, got {progress_bar.n} bytes.")
-    else:
-        logging.info(f"Download complete: {filename}")
+    try:
+        with tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True) as progress_bar:
+            with open(filename, 'wb') as file:
+                for data in response.iter_content(block_size):
+                    if data:
+                        progress_bar.update(len(data))
+                        file.write(data)
+    except Exception as e:
+        logging.error(f"Download interrupted: {e}")
+        # Remove partial file
+        try:
+            Path(filename).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+    downloaded_size = Path(filename).stat().st_size
+    if total_size_in_bytes != 0 and downloaded_size != total_size_in_bytes:
+        logging.error(
+            f"Incomplete download: {downloaded_size}/{total_size_in_bytes} bytes. "
+            f"Removing partial file."
+        )
+        Path(filename).unlink(missing_ok=True)
+        return False
+
+    logging.info(f"Download complete: {filename}")
+    return True
 
 
 def unzip_file(zip_filepath, extract_to):
+    """安全解压 ZIP 文件，防止路径遍历攻击"""
     logging.info(f"Extracting {zip_filepath}...")
+    extract_to = Path(extract_to).resolve()
     with zipfile.ZipFile(zip_filepath, 'r') as zip_ref:
+        for member in zip_ref.infolist():
+            member_path = (extract_to / member.filename).resolve()
+            # 确保解压路径在目标目录内
+            if not str(member_path).startswith(str(extract_to)):
+                raise ValueError(
+                    f"Security: attempted path traversal in zip: {member.filename}"
+                )
+            # 检查解压后文件总大小（防止 zip bomb）
+            if member.file_size > 10 * 1024 * 1024 * 1024:  # 10GB
+                raise ValueError(
+                    f"Security: file too large in zip: {member.filename} ({member.file_size} bytes)"
+                )
         zip_ref.extractall(extract_to)
     logging.info(f"Extraction complete, files located at: {extract_to}")
 
 
 def check_latency(url, timeout=3):
+    """Check if a URL is reachable and measure latency in ms."""
     try:
         start_time = time.time()
         response = requests.head(url, timeout=timeout, allow_redirects=True)
@@ -65,9 +111,34 @@ def check_latency(url, timeout=3):
             
     except requests.RequestException:
         return False, float('inf')
+    finally:
+        # Ensure stream connections are closed
+        try:
+            if 'response' in locals():
+                response.close()
+        except Exception:
+            pass
 
 
-def get_base_url():
+def get_base_url(force_refresh=False):
+    """Select best mirror (cached).  Respects GSV_MIRROR env var."""
+    global base_url
+    if base_url is not None and not force_refresh:
+        return base_url
+
+    # Env var override
+    if _MIRROR_OVERRIDE:
+        mapping = {
+            "modelscope": modelscope_base_url,
+            "huggingface": huggingface_base_url,
+            "hf-mirror": hf_mirror_base_url,
+        }
+        if _MIRROR_OVERRIDE in mapping:
+            base_url = mapping[_MIRROR_OVERRIDE]
+            logging.info(f"Using mirror (env GSV_MIRROR): {_MIRROR_OVERRIDE}")
+            return base_url
+        logging.warning(f"Unknown GSV_MIRROR value '{_MIRROR_OVERRIDE}', auto-detecting")
+
     ms_url = "https://www.modelscope.cn"
     hf_url = "https://huggingface.co"
     hfm_url = "https://hf-mirror.com"
@@ -79,35 +150,37 @@ def get_base_url():
     # ModelScope is best for China — prefer it if available
     if ms_ok and (not hf_ok or ms_latency < hf_latency):
         logging.info("Selected ModelScope.")
-        return modelscope_base_url
+        base_url = modelscope_base_url
+        return base_url
 
     # hf-mirror is fast in China, slower than ModelScope but faster than raw HF
     if hfm_ok and (not hf_ok or hfm_latency < hf_latency):
         logging.info("Selected HF-Mirror (hf-mirror.com).")
-        return hf_mirror_base_url
+        base_url = hf_mirror_base_url
+        return base_url
 
     if hf_ok:
         logging.info("Selected Hugging Face.")
-        return huggingface_base_url
+        base_url = huggingface_base_url
+        return base_url
 
     logging.error("All sources unreachable. Defaulting to HF-Mirror.")
-    return hf_mirror_base_url
+    base_url = hf_mirror_base_url
+    return base_url
 
 
 def download_model(filename, dir, download_url=None):
     if download_url is None:
-        global base_url
-        if base_url is None:
-            base_url = get_base_url()
-            
-        download_url = base_url
+        download_url = get_base_url()
         
     url = download_url % (filename)
     zip_filename = Path(dir) / filename
 
-    download_file(url, zip_filename)
+    if not download_file(url, zip_filename):
+        raise RuntimeError(f"Download of {filename} failed after exhausting retries")
+
     unzip_file(zip_filename, os.path.dirname(zip_filename))
-    os.remove(zip_filename)
+    zip_filename.unlink(missing_ok=True)
 
 
 def check_pretrained_models(models_dir):
@@ -124,22 +197,20 @@ def check_pretrained_models(models_dir):
             break
     
     if is_download:
-        global base_url
-        if base_url is None:
-            base_url = get_base_url()
+        base = get_base_url()
 
         os.makedirs(models_dir, exist_ok=True)
 
-        if base_url == modelscope_base_url:
+        if base == modelscope_base_url:
             download_model(
-                download_url=base_url,
+                download_url=base,
                 filename="pretrained_models5.zip",
                 dir=models_dir,
             )
 
-        elif base_url == huggingface_base_url:
+        elif base == huggingface_base_url:
             download_model(
-                download_url=base_url,
+                download_url=base,
                 filename="pretrained_models6.zip",
                 dir=models_dir,
             )
@@ -153,7 +224,7 @@ def check_pretrained_models(models_dir):
         else:
             # hf-mirror or any other: download same zip as HF
             download_model(
-                download_url=base_url,
+                download_url=base,
                 filename="pretrained_models6.zip",
                 dir=models_dir,
             )
@@ -166,20 +237,8 @@ def check_pretrained_models(models_dir):
 
 
 def ensure_default_models(models_dir):
-    """Download default GPT and SoVITS model files if not present.
-
-    Downloads s1v3.ckpt (~300MB) and s2Gv2ProPlus.pth (~500MB) using the
-    automatically selected mirror (ModelScope > hf-mirror > HuggingFace).
-
-    These are single .ckpt/.pth files (not zips), downloaded directly to models_dir.
-    Existing files are skipped.
-
-    Args:
-        models_dir: Directory to place the model files (typically ~/.cache/gsv/).
-    """
-    global base_url
-    if base_url is None:
-        base_url = get_base_url()
+    """Download default GPT and SoVITS model files if not present."""
+    base = get_base_url()
 
     os.makedirs(models_dir, exist_ok=True)
 
@@ -189,29 +248,29 @@ def ensure_default_models(models_dir):
             logging.info(f"Default model already exists: {filename}")
             continue
 
-        # Try primary URL (auto-selected mirror)
-        url = base_url % filename
+        url = base % filename
         logging.info(f"Downloading default model: {filename}")
         try:
-            download_file(url, filepath)
+            if not download_file(url, filepath):
+                raise RuntimeError(f"Download incomplete: {filename}")
         except Exception as e:
             logging.warning(f"Primary download failed for {filename}: {e}")
 
             # Fallback chain
             fallbacks = []
-            if base_url != hf_mirror_base_url:
+            if base != hf_mirror_base_url:
                 fallbacks.append(("hf-mirror.com", hf_mirror_base_url))
-            if base_url != huggingface_base_url:
+            if base != huggingface_base_url:
                 fallbacks.append(("Hugging Face", huggingface_base_url))
-            if base_url != modelscope_base_url:
+            if base != modelscope_base_url:
                 fallbacks.append(("ModelScope", modelscope_base_url))
 
             for name, fb_url in fallbacks:
                 try:
                     logging.info(f"Trying {name} fallback: {filename}")
-                    download_file(fb_url % filename, filepath)
-                    logging.info(f"Downloaded via {name}")
-                    break
+                    if download_file(fb_url % filename, filepath):
+                        logging.info(f"Downloaded via {name}")
+                        break
                 except Exception as e2:
                     logging.warning(f"{name} fallback failed: {e2}")
             else:
@@ -227,11 +286,9 @@ cnroberta_int8_huggingface_base_url = "https://huggingface.co/cnmds/GPTSoVITS-RT
 def download_cnroberta_int8(dir, download_url=None):
     """下载 CNRoberta INT8 Dynamic ONNX 模型"""
     if download_url is None:
-        global base_url
-        if base_url is None:
-            base_url = get_base_url()
+        base = get_base_url()
         
-        if base_url == modelscope_base_url:
+        if base == modelscope_base_url:
             download_url = cnroberta_int8_modelscope_base_url
         else:
             download_url = cnroberta_int8_huggingface_base_url
@@ -253,6 +310,7 @@ def download_cnroberta_int8(dir, download_url=None):
             continue
         
         logging.info(f"正在下载: {filename}")
-        download_file(url, filepath)
+        if not download_file(url, filepath):
+            raise RuntimeError(f"Failed to download {filename}")
     
     logging.info(f"CNRoberta INT8 ONNX 模型下载完成: {dir}")
