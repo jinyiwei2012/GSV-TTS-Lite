@@ -675,6 +675,210 @@ class TTS:
         inp.all_ge = all_ge
         return inp
 
+    def _run_batched_gpt(
+        self, inp: _BatchedInputs, t2s_model,
+        top_k: int, top_p: float, temperature: float, repetition_penalty: float,
+    ):
+        """Run GPT batched inference, then sort and interleave by length."""
+        logging.info("Running GPT batched inference (Text-to-Semantic)...")
+        pred_semantic, semantic_orig_idx = t2s_model.infer_batched(
+            inp.all_phoneme_ids, inp.all_prompts, inp.all_bert_features,
+            top_k=top_k, top_p=top_p, temperature=temperature,
+            repetition_penalty=repetition_penalty,
+        )
+
+        semantic_lengths = torch.tensor(
+            [len(s) for s in pred_semantic], device=self.tts_config.device,
+        )
+
+        # 将排序后的索引进行双端交错重排，平衡各 Batch 间的序列长度
+        idx_map = torch.argsort(semantic_lengths)
+        n = len(idx_map)
+        sorted_indices = torch.arange(n, device=self.tts_config.device)
+        interleave_idx = torch.zeros(n, dtype=torch.long, device=self.tts_config.device)
+        interleave_idx[0::2] = sorted_indices[:(n + 1) // 2]
+        interleave_idx[1::2] = sorted_indices[(n + 1) // 2:].flip(0)
+        idx_map = idx_map[interleave_idx]
+
+        pred_semantic = [pred_semantic[i] for i in idx_map.tolist()]
+        semantic_orig_idx = semantic_orig_idx[idx_map]
+        semantic_lengths = semantic_lengths[idx_map]
+        return pred_semantic, semantic_orig_idx, semantic_lengths
+
+    def _run_batched_sovits(
+        self, inp: _BatchedInputs, vq_model,
+        pred_semantic, semantic_orig_idx, semantic_lengths,
+        sovits_batch_size: int, noise_scale: float, speed: float,
+        return_subtitles: bool,
+    ):
+        """Run SoVITS batched decoding and split audio by segment."""
+        logging.info("Running SoVITS batched inference (Semantic-to-Waveform)...")
+
+        generated_audios = []
+        generated_subtitles = []
+        num_samples = len(pred_semantic)
+
+        for i in tqdm(range(0, num_samples, sovits_batch_size)):
+            batch_end = min(i + sovits_batch_size, num_samples)
+
+            semantic_list = pred_semantic[i:batch_end]
+            curr_orig_indices = semantic_orig_idx[i:batch_end]
+            curr_lengths = semantic_lengths[i:batch_end]
+
+            ge_list = []
+            phones2_list = []
+            phone_lens = []
+            for idx2, length in enumerate(curr_lengths):
+                orig_idx = curr_orig_indices[idx2]
+                ge_list.append(inp.all_ge[orig_idx].expand(-1, length))
+                phones2_list.append(
+                    torch.LongTensor(inp.all_phones2[orig_idx]).to(self.tts_config.device))
+                phone_lens.append(len(inp.all_phones2[orig_idx]))
+
+            curr_ge = torch.cat(ge_list, dim=1).unsqueeze(0)
+            curr_semantic = torch.cat(semantic_list).unsqueeze(0).unsqueeze(0)
+            curr_phones2 = torch.cat(phones2_list).unsqueeze(0)
+
+            phone_lens_t = torch.tensor(phone_lens, device=self.tts_config.device)
+            ends = torch.cumsum(phone_lens_t, dim=0)
+            starts = ends - phone_lens_t
+            pairs = torch.stack([starts, ends], dim=1)
+            slice_indices = torch.repeat_interleave(pairs, curr_lengths * 2, dim=0)
+
+            curr_word2ph = {
+                "word": [w for idx2 in curr_orig_indices for w in inp.all_word2ph[idx2]["word"]],
+                "ph": [p for idx2 in curr_orig_indices for p in inp.all_word2ph[idx2]["ph"]],
+            }
+
+            audio_batch, attn = vq_model.decode(
+                curr_semantic, curr_phones2, curr_ge,
+                noise_scale=noise_scale, speed=speed,
+                cuda_graph=False, slice_indices=slice_indices,
+            )
+
+            audio_batch = audio_batch[0, 0, :]
+
+            if return_subtitles:
+                assign = self._viterbi_monotonic(attn)
+                subtitles = self._get_subtitles(curr_word2ph, assign, speed)
+
+                if not self._check_pause(subtitles[-1]['text']):
+                    subtitles.append({
+                        "text": curr_word2ph['word'][-1],
+                        "start_s": subtitles[-1]['end_s'],
+                        "end_s": subtitles[-1]['end_s'],
+                    })
+
+            max_audio = torch.abs(audio_batch).max()
+            if max_audio > 1.0:
+                audio_batch = audio_batch / max_audio
+
+            if return_subtitles:
+                last_i = 0
+                for j in range(len(semantic_list)):
+                    best_i = self._find_subtitles(
+                        subtitles, inp.all_word2ph[curr_orig_indices[j]], last_i)
+                    subtitle = subtitles[last_i:best_i]
+                    last_i = best_i
+
+                    last_actual_len = int(subtitle[0]["start_s"] * self.samplerate)
+                    actual_len = int(subtitle[-1]["end_s"] * self.samplerate)
+                    audio = audio_batch[last_actual_len:actual_len]
+
+                    head_offset = self._find_head_threshold_offsets(audio)
+                    tail_offset = self._find_tail_threshold_offsets(audio)
+                    audio = audio[head_offset:-tail_offset].float().cpu().numpy()
+
+                    subtitle[0]["start_s"] += head_offset / self.samplerate
+                    subtitle[-1]["end_s"] -= tail_offset / self.samplerate
+
+                    subtitle = sub2text_index(
+                        subtitle, inp.all_norm_text[curr_orig_indices[j]],
+                        inp.texts[curr_orig_indices[j]])
+
+                    generated_audios.append(audio)
+                    generated_subtitles.append(subtitle)
+            else:
+                last_actual_len = 0
+                for j in range(len(semantic_list)):
+                    actual_len = (
+                        last_actual_len
+                        + curr_lengths[j] * 2 * vq_model.samples_per_frame / speed
+                    )
+                    audio = audio_batch[int(last_actual_len):int(actual_len)]
+                    last_actual_len = actual_len
+
+                    head_offset = self._find_head_threshold_offsets(audio)
+                    tail_offset = self._find_tail_threshold_offsets(audio)
+                    audio = audio[head_offset:-tail_offset].float().cpu().numpy()
+
+                    generated_audios.append(audio)
+
+        logging.info(
+            f"Inference complete. Generated {len(generated_audios)} audio segments.")
+        return generated_audios, generated_subtitles
+
+    def _assemble_batched_results(
+        self, inp: _BatchedInputs,
+        generated_audios, generated_subtitles,
+        semantic_orig_idx, return_subtitles: bool,
+    ) -> tuple:
+        """Reorder, merge segments with silence, and produce AudioClip tuple."""
+        ordered_audios = [None] * len(generated_audios)
+        ordered_subtitles = [None] * len(generated_audios)
+        for current_pos, original_pos in enumerate(semantic_orig_idx.tolist()):
+            ordered_audios[original_pos] = generated_audios[current_pos]
+            if return_subtitles:
+                ordered_subtitles[original_pos] = generated_subtitles[current_pos]
+
+        last_orig_idx = None
+        final_ordered_audios = [[] for _ in range(inp.n_orig)]
+        final_ordered_subtitles = [[] for _ in range(inp.n_orig)]
+        for i, (audio_data, subtitle) in enumerate(
+                zip(ordered_audios, ordered_subtitles)):
+            orig_idx = inp.segment_to_original_map[i]
+            final_ordered_audios[orig_idx].append(audio_data)
+
+            if inp.texts[i][-1] in inp.cut_mute_scale_map:
+                cut_mute_scale = inp.cut_mute_scale_map[inp.texts[i][-1]]
+            elif "…" in inp.cut_mute_scale_map and inp.texts[i][-3:] in ["...", "。。。"]:
+                cut_mute_scale = inp.cut_mute_scale_map["…"]
+            else:
+                cut_mute_scale = 1.0
+            silence = np.zeros(
+                (int(inp.cut_mute * cut_mute_scale * self.samplerate),),
+                dtype=audio_data.dtype)
+            final_ordered_audios[orig_idx].append(silence)
+
+            if return_subtitles:
+                if orig_idx != last_orig_idx:
+                    cur_text_l = 0
+                    last_orig_idx = orig_idx
+
+                subtitle[-1]["end_s"] += inp.cut_mute * cut_mute_scale
+                self._increment_subtitle_indices(subtitle, cur_text_l)
+                final_ordered_subtitles[orig_idx].append(subtitle)
+
+                cur_text_l += len(inp.texts[i])
+
+        result = []
+        for audio_list, subtitles_list, orig_text in zip(
+                final_ordered_audios, final_ordered_subtitles, inp.orig_texts):
+            audio = np.concatenate(audio_list)
+            audio_len_s = len(audio) / self.samplerate
+
+            if return_subtitles:
+                subtitle = self._cat_subtitles(*subtitles_list)
+                result.append(AudioClip(
+                    self.audio_queue, audio, self.samplerate,
+                    audio_len_s, subtitle, orig_text))
+            else:
+                result.append(AudioClip(
+                    self.audio_queue, audio, self.samplerate,
+                    audio_len_s, [], orig_text))
+
+        return tuple(result)
+
     @torch.inference_mode()
     def infer_batched(
         self,
@@ -758,184 +962,20 @@ class TTS:
 
             # Resolve models for inference
             gpt_model = self._resolve_gpt_model(gpt_model)
-            sovits_model = inp.sovits_model
             gpt = self.gpt_models[gpt_model]
-            sovits = self.sovits_models[sovits_model]
-            t2s_model = gpt.t2s_model
-            vq_model = sovits.vq_model
+            sovits = self.sovits_models[inp.sovits_model]
 
-            logging.info("Running GPT batched inference (Text-to-Semantic)...")
-            pred_semantic, semantic_orig_idx = t2s_model.infer_batched(
-                inp.all_phoneme_ids,
-                inp.all_prompts,
-                inp.all_bert_features,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
+            pred_semantic, semantic_orig_idx, semantic_lengths = self._run_batched_gpt(
+                inp, gpt.t2s_model, top_k, top_p, temperature, repetition_penalty)
 
-            semantic_lengths = torch.tensor([len(semantic) for semantic in pred_semantic], device=self.tts_config.device)
+            generated_audios, generated_subtitles = self._run_batched_sovits(
+                inp, sovits.vq_model,
+                pred_semantic, semantic_orig_idx, semantic_lengths,
+                sovits_batch_size, noise_scale, speed, return_subtitles)
 
-            idx_map = torch.argsort(semantic_lengths)
-
-            # 将排序后的索引进行双端交错重排，平衡各 Batch 间的序列长度，避免因长短不一导致的计算负载不均
-            n = len(idx_map)
-            sorted_indices = torch.arange(n, device=self.tts_config.device)
-            interleave_idx = torch.zeros(n, dtype=torch.long, device=self.tts_config.device)
-            interleave_idx[0::2] = sorted_indices[:(n + 1) // 2]
-            interleave_idx[1::2] = sorted_indices[(n + 1) // 2:].flip(0)
-
-            idx_map = idx_map[interleave_idx]
-
-            pred_semantic = [pred_semantic[i] for i in idx_map.tolist()]
-            semantic_orig_idx = semantic_orig_idx[idx_map]
-            semantic_lengths = semantic_lengths[idx_map]
-
-            logging.info("Running SoVITS batched inference (Semantic-to-Waveform)...")
-
-            generated_audios = []
-            generated_subtitles = []
-            num_samples = len(pred_semantic)
-
-            for i in tqdm(range(0, num_samples, sovits_batch_size)):
-                batch_end = min(i + sovits_batch_size, num_samples)
-                
-                semantic_list = pred_semantic[i:batch_end]
-                curr_orig_indices = semantic_orig_idx[i:batch_end]
-                curr_lengths = semantic_lengths[i:batch_end]
-
-                ge_list = []
-                phones2_list = []
-                phone_lens = []
-                for idx, length in enumerate(curr_lengths):
-                    orig_idx = curr_orig_indices[idx]
-                    ge_list.append(inp.all_ge[orig_idx].expand(-1, length))
-                    phones2_list.append(torch.LongTensor(inp.all_phones2[orig_idx]).to(self.tts_config.device))
-                    phone_lens.append(len(inp.all_phones2[orig_idx]))
-                
-                curr_ge = torch.cat(ge_list, dim=1).unsqueeze(0)
-                curr_semantic = torch.cat(semantic_list).unsqueeze(0).unsqueeze(0)
-                curr_phones2 = torch.cat(phones2_list).unsqueeze(0)
-
-                phone_lens = torch.tensor(phone_lens, device=self.tts_config.device)
-                ends = torch.cumsum(phone_lens, dim=0)
-                starts = ends - phone_lens
-                pairs = torch.stack([starts, ends], dim=1)
-                slice_indices = torch.repeat_interleave(pairs, curr_lengths * 2, dim=0)
-
-                curr_word2ph = {
-                    "word": [w for idx in curr_orig_indices for w in inp.all_word2ph[idx]["word"]],
-                    "ph": [p for idx in curr_orig_indices for p in inp.all_word2ph[idx]["ph"]]
-                }
-
-                # ge [B, D, T]
-                # semantic [n_q, B, N]
-
-                audio_batch, attn = vq_model.decode(
-                    curr_semantic, curr_phones2, curr_ge, noise_scale=noise_scale, speed=speed, cuda_graph=False, slice_indices=slice_indices
-                )
-
-                audio_batch = audio_batch[0, 0, :]
-
-                if return_subtitles:
-                    assign = self._viterbi_monotonic(attn)
-                    subtitles = self._get_subtitles(curr_word2ph, assign, speed)
-
-                    if not self._check_pause(subtitles[-1]['text']):
-                        subtitles.append({
-                            "text": curr_word2ph['word'][-1],
-                            "start_s": subtitles[-1]['end_s'],
-                            "end_s": subtitles[-1]['end_s']
-                        })
-
-                max_audio = torch.abs(audio_batch).max()
-                if max_audio > 1.0:
-                    audio_batch = audio_batch / max_audio
-
-                if return_subtitles:
-                    last_i = 0
-                    for j in range(len(semantic_list)):
-                        best_i = self._find_subtitles(subtitles, inp.all_word2ph[curr_orig_indices[j]], last_i)
-                        subtitle = subtitles[last_i:best_i]
-                        last_i = best_i
-                        
-                        last_actual_len = int(subtitle[0]["start_s"] * self.samplerate)
-                        actual_len = int(subtitle[-1]["end_s"] * self.samplerate)
-                        audio = audio_batch[last_actual_len:actual_len]
-
-                        head_offset = self._find_head_threshold_offsets(audio)
-                        tail_offset = self._find_tail_threshold_offsets(audio)
-                        audio = audio[head_offset:-tail_offset].float().cpu().numpy()
-
-                        subtitle[0]["start_s"] += head_offset / self.samplerate
-                        subtitle[-1]["end_s"] -= tail_offset / self.samplerate
-
-                        subtitle = sub2text_index(subtitle, inp.all_norm_text[curr_orig_indices[j]], inp.texts[curr_orig_indices[j]])
-
-                        generated_audios.append(audio)
-                        generated_subtitles.append(subtitle)
-                else:
-                    last_actual_len = 0
-                    for j in range(len(semantic_list)):
-                        actual_len = last_actual_len + curr_lengths[j] * 2 * vq_model.samples_per_frame / speed
-                        audio = audio_batch[int(last_actual_len):int(actual_len)]
-                        last_actual_len = actual_len
-
-                        head_offset = self._find_head_threshold_offsets(audio)
-                        tail_offset = self._find_tail_threshold_offsets(audio)
-                        audio = audio[head_offset:-tail_offset].float().cpu().numpy()
-
-                        generated_audios.append(audio)
-
-            logging.info(f"Inference complete. Generated {len(generated_audios)} audio segments.")
-
-            ordered_audios = [None] * len(generated_audios)
-            ordered_subtitles = [None] * len(generated_audios)
-            for current_pos, original_pos in enumerate(semantic_orig_idx.tolist()):
-                ordered_audios[original_pos] = generated_audios[current_pos]
-                if return_subtitles:
-                    ordered_subtitles[original_pos] = generated_subtitles[current_pos]
-
-            last_orig_idx = None
-            final_ordered_audios = [[] for _ in range(inp.n_orig)]
-            final_ordered_subtitles = [[] for _ in range(inp.n_orig)]
-            for i, (audio_data, subtitle) in enumerate(zip(ordered_audios, ordered_subtitles)):
-                orig_idx = inp.segment_to_original_map[i]
-                final_ordered_audios[orig_idx].append(audio_data)
-
-                if inp.texts[i][-1] in inp.cut_mute_scale_map:
-                    cut_mute_scale = inp.cut_mute_scale_map[inp.texts[i][-1]]
-                elif "…" in inp.cut_mute_scale_map and inp.texts[i][-3:] in ["...", "。。。"]:
-                    cut_mute_scale = inp.cut_mute_scale_map["…"]
-                else:
-                    cut_mute_scale = 1.0
-                silence = np.zeros((int(inp.cut_mute * cut_mute_scale * self.samplerate),), dtype=audio_data.dtype)
-                final_ordered_audios[orig_idx].append(silence)
-
-                if return_subtitles:
-                    if orig_idx != last_orig_idx:
-                        cur_text_l = 0
-                        last_orig_idx = orig_idx
-
-                    subtitle[-1]["end_s"] += inp.cut_mute * cut_mute_scale
-                    self._increment_subtitle_indices(subtitle, cur_text_l)
-                    final_ordered_subtitles[orig_idx].append(subtitle)
-
-                    cur_text_l += len(inp.texts[i])
-            
-            result = []
-            for audio_list, subtitles_list, orig_text in zip(final_ordered_audios, final_ordered_subtitles, inp.orig_texts):
-                audio = np.concatenate(audio_list)
-                audio_len_s = len(audio) / self.samplerate
-                
-                if return_subtitles:
-                    subtitle = self._cat_subtitles(*subtitles_list)
-                    result.append(AudioClip(self.audio_queue, audio, self.samplerate, audio_len_s, subtitle, orig_text))
-                else:
-                    result.append(AudioClip(self.audio_queue, audio, self.samplerate, audio_len_s, [], orig_text))
-            
-            return tuple(result)
+            return self._assemble_batched_results(
+                inp, generated_audios, generated_subtitles,
+                semantic_orig_idx, return_subtitles)
         
         finally:
             self._infer_lock.release()
