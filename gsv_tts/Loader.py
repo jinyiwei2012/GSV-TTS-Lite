@@ -8,6 +8,7 @@ from safetensors.torch import load_model
 from .Config import Config
 from .GPT_SoVITS.SoVITS.models import SynthesizerTrn
 from .GPT_SoVITS.GPT.t2s_model import Text2SemanticDecoder
+from .GPT_SoVITS.GPT.t2s_base import Text2SemanticDecoderBase  # shared base
 from .GPT_SoVITS import utils
 
 import sys
