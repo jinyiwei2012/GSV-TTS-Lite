@@ -24,10 +24,12 @@ from pathlib import Path
 
 class ChineseG2P:
     def __init__(self, models_dir):
-        self.pinyin_to_symbol_map = {
-            line.split("\t")[0]: line.strip().split("\t")[1]
-            for line in open(Path(models_dir) / "g2p" / "zh" / "opencpop-strict.txt").readlines()
-        }
+        dict_path = Path(models_dir) / "g2p" / "zh" / "opencpop-strict.txt"
+        with open(dict_path, encoding="utf-8") as f:
+            self.pinyin_to_symbol_map = {
+                line.split("\t")[0]: line.strip().split("\t")[1]
+                for line in f
+            }
 
         self.tone_modifier = ToneSandhi()
 

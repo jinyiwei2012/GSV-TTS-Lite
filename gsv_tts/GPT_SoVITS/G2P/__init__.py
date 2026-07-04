@@ -44,7 +44,11 @@ def text_to_phonemes(text, language):
         norm_text = global_config.english_g2p.text_normalize(text)
         phones, word2ph = global_config.english_g2p.g2p(norm_text)
     
-    assert len(phones) == sum(word2ph["ph"]), f"length mismatch: The length of phones is {len(phones)}, while the total of word2ph is {sum(word2ph['ph'])}"
+    if len(phones) != sum(word2ph["ph"]):
+        raise ValueError(
+            f"Phone count mismatch: {len(phones)} vs {sum(word2ph['ph'])}. "
+            f"G2P output inconsistent with word2ph."
+        )
     
     # 替换停顿符
     for i, ph in enumerate(phones):
