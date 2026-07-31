@@ -244,16 +244,16 @@ def _load_gpt_state_dict(gpt_path: str) -> tuple[dict[str, torch.Tensor], dict]:
     """
     if os.path.isdir(gpt_path):
         # Safetensors: read config + model.safetensors
+        # The exported safetensors already use model-internal naming
+        # (e.g. 't2s_transformer.blocks.0.qkv.weight'), matching the
+        # ckpt branch output below — read tensors directly.
         with open(os.path.join(gpt_path, "config.json"), "r") as f:
             config = json.load(f)
-        # Build a temporary model on meta device to get state_dict keys, then load
-        with torch.device("meta"):
-            t2s_model = Text2SemanticDecoder(config)
+        from safetensors import safe_open
         state_dict = {}
-        load_model(t2s_model, os.path.join(gpt_path, "model.safetensors"))
-        for name, param in t2s_model.named_parameters():
-            state_dict[name] = param.data.clone().cpu()
-        del t2s_model
+        with safe_open(os.path.join(gpt_path, "model.safetensors"), framework="pt", device="cpu") as sf:
+            for key in sf.keys():
+                state_dict[key] = sf.get_tensor(key)
     else:
         dict_s1 = torch.load(gpt_path, map_location="cpu", weights_only=False)
         config = dict_s1["config"]
@@ -295,12 +295,23 @@ def _load_sovits_state_dict(sovits_path: str) -> tuple[dict[str, torch.Tensor], 
     if os.path.isdir(sovits_path):
         with open(os.path.join(sovits_path, "hps.json"), "r") as f:
             hps = json.load(f)
-        # For safetensors, we can read weights directly without building a model
+        # Safetensors: we can read weights directly without building a model
         from safetensors import safe_open
         state_dict = {}
         with safe_open(os.path.join(sovits_path, "model.safetensors"), framework="pt", device="cpu") as sf:
             for key in sf.keys():
                 state_dict[key] = sf.get_tensor(key)
+        # Detect version for safetensors dirs from architecture hints
+        # (sv_emb/ge_to512/prelu exist only in v2Pro+), mirroring the
+        # load_sovits() version injection used by the .pth path.
+        if "version" not in hps.get("model", {}):
+            if any(
+                k.startswith(("sv_emb", "ge_to512", "prelu"))
+                for k in state_dict
+            ):
+                hps.setdefault("model", {})["version"] = "v2ProPlus"
+            else:
+                hps.setdefault("model", {})["version"] = "v2"
     else:
         dict_s2, version = load_sovits(sovits_path)
         hps = dict_s2["config"]
