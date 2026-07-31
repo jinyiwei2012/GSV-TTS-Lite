@@ -398,6 +398,9 @@ class TTSStreamRequest(BaseModel):
     prompt_audio: str = Field(..., description="提示音频路径或URL")
     prompt_text: Optional[str] = Field(None, description="提示音频文本，为空时自动ASR识别")
     
+    text_language: str = Field("auto", description="目标文本语言: auto/ja/zh/en")
+    prompt_language: str = Field("auto", description="提示音频文本语言: auto/ja/zh/en")
+    
     is_cut_text: bool = Field(True, description="是否按标点切分文本")
     cut_minlen: int = Field(10, description="文本切分最小长度")
     cut_mute: float = Field(0.3, description="切分后的静音时长(秒)")
@@ -420,6 +423,9 @@ class TTSBatchedRequest(BaseModel):
     speaker_audio: str = Field(..., description="说话人参考音频路径或URL")
     prompt_audio: str = Field(..., description="提示音频路径或URL")
     prompt_text: Optional[str] = Field(None, description="提示音频文本，为空时自动ASR识别")
+    
+    text_languages: Union[str, list[str]] = Field("auto", description="目标文本语言: auto/ja/zh/en 或逐句列表")
+    prompt_languages: Union[str, list[str]] = Field("auto", description="提示音频文本语言: auto/ja/zh/en 或逐句列表")
     
     is_cut_text: bool = Field(True, description="是否按标点切分文本")
     cut_minlen: int = Field(10, description="文本切分最小长度")
@@ -618,6 +624,8 @@ async def tts_stream(request: TTSStreamRequest):
                             prompt_audio_path=final_prompt_audio,
                             prompt_audio_text=final_prompt_text,
                             text=request.text,
+                            text_language=request.text_language,
+                            prompt_language=request.prompt_language,
                             is_cut_text=request.is_cut_text,
                             cut_minlen=request.cut_minlen,
                             cut_mute=request.cut_mute,
@@ -725,6 +733,8 @@ async def tts_batched(request: TTSBatchedRequest):
             prompt_audio_paths=prompt_audio,
             prompt_audio_texts=prompt_text,
             texts=request.texts,
+            text_languages=request.text_languages,
+            prompt_languages=request.prompt_languages,
             return_subtitles=request.return_subtitles,
             is_cut_text=request.is_cut_text,
             cut_minlen=request.cut_minlen,

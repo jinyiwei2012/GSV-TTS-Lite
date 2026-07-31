@@ -25,6 +25,8 @@ python personal_api.py
 | speaker_audio | string | 是 | - | 说话人参考音频路径或URL |
 | prompt_audio | string | 是 | - | 提示音频路径或URL |
 | prompt_text | string | 否 | - | 提示音频文本，为空时自动ASR识别 |
+| text_language | string | 否 | "auto" | 目标文本语言: auto/ja/zh/en，混语文本建议手动指定 |
+| prompt_language | string | 否 | "auto" | 提示音频文本语言: auto/ja/zh/en |
 | is_cut_text | bool | 否 | true | 是否按标点切分文本 |
 | cut_minlen | int | 否 | 10 | 文本切分最小长度 |
 | cut_mute | float | 否 | 0.3 | 切分后的静音时长(秒) |
@@ -89,6 +91,8 @@ async def stream_tts():
 | speaker_audio | string | 是 | - | 说话人参考音频路径或URL |
 | prompt_audio | string | 是 | - | 提示音频路径或URL |
 | prompt_text | string | 否 | - | 提示音频文本，为空时自动ASR识别 |
+| text_languages | string/[string] | 否 | "auto" | 目标文本语言: auto/ja/zh/en，支持逐句列表 |
+| prompt_languages | string/[string] | 否 | "auto" | 提示音频文本语言: auto/ja/zh/en，支持逐句列表 |
 | is_cut_text | bool | 否 | true | 是否按标点切分文本 |
 | cut_minlen | int | 否 | 10 | 文本切分最小长度 |
 | cut_mute | float | 否 | 0.3 | 切分后的静音时长(秒) |

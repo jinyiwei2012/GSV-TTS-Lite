@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 from gsv_tts import TTS, MultiSpeakerTTS, SpeakerConfig, ConfigMismatchError
 import uuid
 import os
@@ -90,6 +90,8 @@ class TTSSingleRequest(BaseModel):
     speaker_audio: str
     prompt_audio: str
     prompt_text: Optional[str] = None
+    text_language: str = "auto"
+    prompt_language: str = "auto"
     top_k: int = 5
     top_p: float = 0.9
     temperature: float = 1.0
@@ -103,6 +105,8 @@ class TTSBatchRequest(BaseModel):
     speaker_audio: str
     prompt_audio: str
     prompt_text: Optional[str] = None
+    text_languages: Union[str, List[str]] = "auto"
+    prompt_languages: Union[str, List[str]] = "auto"
     top_k: int = 5
     top_p: float = 0.9
     temperature: float = 1.0
@@ -138,6 +142,8 @@ class MultiRemoveSpeakerRequest(BaseModel):
 class MultiInferRequest(BaseModel):
     speaker: str
     text: str
+    text_language: str = "auto"
+    prompt_language: str = "auto"
     top_k: int = 5
     top_p: float = 0.9
     temperature: float = 1.0
@@ -250,6 +256,8 @@ async def tts_single(request: TTSSingleRequest):
             prompt_audio_path=prompt_audio,
             prompt_audio_text=prompt_text,
             text=request.text,
+            text_language=request.text_language,
+            prompt_language=request.prompt_language,
             top_k=request.top_k,
             top_p=request.top_p,
             temperature=request.temperature,
@@ -301,6 +309,8 @@ async def tts_batch(request: TTSBatchRequest):
             prompt_audio_paths=prompt_audio,
             prompt_audio_texts=prompt_text,
             texts=request.texts,
+            text_languages=request.text_languages,
+            prompt_languages=request.prompt_languages,
             top_k=request.top_k,
             top_p=request.top_p,
             temperature=request.temperature,
@@ -456,6 +466,8 @@ async def multi_infer(request: MultiInferRequest):
         audio_clip = multi_tts.infer(
             speaker=request.speaker,
             text=request.text,
+            text_language=request.text_language,
+            prompt_language=request.prompt_language,
             top_k=request.top_k,
             top_p=request.top_p,
             temperature=request.temperature,
@@ -498,7 +510,20 @@ async def multi_batch(request: MultiBatchRequest):
 
     try:
         speaker_texts = [(req.speaker, req.text) for req in request.speaker_texts]
-        audio_clips = multi_tts.infer_batched(speaker_texts)
+
+        # 语言参数：所有条目相同则传单个 str，否则逐条传 list
+        text_languages = [r.text_language for r in request.speaker_texts]
+        prompt_languages = [r.prompt_language for r in request.speaker_texts]
+        if len(set(text_languages)) == 1:
+            text_languages = text_languages[0]
+        if len(set(prompt_languages)) == 1:
+            prompt_languages = prompt_languages[0]
+
+        audio_clips = multi_tts.infer_batched(
+            speaker_texts,
+            text_languages=text_languages,
+            prompt_languages=prompt_languages,
+        )
 
         filenames = []
         for clip in audio_clips:

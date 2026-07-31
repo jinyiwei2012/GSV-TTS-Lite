@@ -118,6 +118,8 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
     "speaker_audio": "examples/laffey.mp3",
     "prompt_audio": "examples/AnAn.ogg",
     "prompt_text": "ちが……ちがう。レイア、貴様は間違っている。",
+    "text_language": "auto",
+    "prompt_language": "auto",
     "top_k": 5,
     "top_p": 0.9,
     "temperature": 1.0,
@@ -126,7 +128,7 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
     "speed": 1.0
   }
   ```
-  > **注意**：`prompt_text` 可选，如果不提供会自动使用 ASR 识别。`speaker_audio` 和 `prompt_audio` 支持本地路径或外链 URL。
+  > **注意**：`prompt_text` 可选，如果不提供会自动使用 ASR 识别。`speaker_audio` 和 `prompt_audio` 支持本地路径或外链 URL。`text_language` / `prompt_language` 可选，支持 `"auto"` / `"ja"` / `"zh"` / `"en"`，默认自动检测；混语文本建议手动指定。
 
 - **响应示例**：
   ```json
@@ -147,9 +149,12 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
     "texts": ["第一个请求", "第二个请求"],
     "speaker_audio": "examples/laffey.mp3",
     "prompt_audio": "examples/AnAn.ogg",
-    "prompt_text": "ちが……ちがう。レイア、貴様は間違っている。"
+    "prompt_text": "ちが……ちがう。レイア、貴様は間違っている。",
+    "text_languages": "auto",
+    "prompt_languages": "auto"
   }
   ```
+  > `text_languages` / `prompt_languages` 支持单个字符串（全部相同）或逐句列表（`["ja", "zh"]`）。
 - **响应示例**：
   ```json
   {
@@ -328,8 +333,14 @@ curl "http://localhost:8000/multi-speaker/list"
 ```bash
 curl -X POST "http://localhost:8000/multi-speaker/infer" \
   -H "Content-Type: application/json" \
-  -d '{"speaker": "alice", "text": "こんにちは！"}'
+  -d '{
+    "speaker": "alice",
+    "text": "こんにちは！",
+    "text_language": "ja",
+    "prompt_language": "ja"
+  }'
 ```
+> `text_language` / `prompt_language` 可选，支持 `"auto"` / `"ja"` / `"zh"` / `"en"`。
 
 **5. 多角色批量推理**
 ```bash
@@ -337,12 +348,12 @@ curl -X POST "http://localhost:8000/multi-speaker/batch" \
   -H "Content-Type: application/json" \
   -d '{
     "speaker_texts": [
-      {"speaker": "alice", "text": "こんにちは"},
-      {"speaker": "bob",   "text": "よろしく"}
+      {"speaker": "alice", "text": "こんにちは", "text_language": "ja"},
+      {"speaker": "bob",   "text": "你好", "text_language": "zh"}
     ]
   }'
 ```
-> 相同角色自动 GPU 并行，不同角色按组分别批量处理。
+> 相同角色自动 GPU 并行，不同角色按组分别批量处理。每条可独立指定 `text_language` / `prompt_language`，全部相同时也可省略（默认 `"auto"`）。
 
 ### 自动兼容性
 
