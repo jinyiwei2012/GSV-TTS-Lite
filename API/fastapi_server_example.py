@@ -5,6 +5,9 @@ FastAPI 服务端使用示例
 """
 
 import sys
+import asyncio
+import json
+import base64
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -12,7 +15,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Union
 from gsv_tts import TTS, MultiSpeakerTTS, SpeakerConfig, ConfigMismatchError
@@ -157,6 +160,24 @@ class MultiInferRequest(BaseModel):
 class MultiBatchRequest(BaseModel):
     speaker_texts: List[MultiInferRequest]
     """List of (speaker, text) pairs for multi-speaker batch inference."""
+
+
+class MultiStreamRequest(BaseModel):
+    speaker: str
+    text: str
+    text_language: str = "auto"
+    prompt_language: str = "auto"
+    prompt_audio_path: Optional[str] = None
+    prompt_audio_text: Optional[str] = None
+    top_k: int = 5
+    top_p: float = 0.9
+    temperature: float = 1.0
+    repetition_penalty: float = 1.35
+    noise_scale: float = 0.5
+    speed: float = 1.0
+    stream_chunk: int = 25
+    overlap_len: int = 5
+    boost_first_chunk: bool = True
 
 
 @asynccontextmanager
@@ -553,6 +574,82 @@ async def multi_batch(request: MultiBatchRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/stream")
+async def multi_stream(request: MultiStreamRequest):
+    """Multi-speaker streaming inference via SSE.
+
+    Yields `event: audio` chunks (base64 WAV), then `event: done` with the
+    total duration, or `event: error` on failure.
+    """
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    async def generate():
+        try:
+            loop = asyncio.get_running_loop()
+            chunk_queue: asyncio.Queue = asyncio.Queue()
+
+            def stream_infer():
+                try:
+                    for clip in multi_tts.infer_stream(
+                        speaker=request.speaker,
+                        text=request.text,
+                        prompt_audio_path=request.prompt_audio_path,
+                        prompt_audio_text=request.prompt_audio_text,
+                        text_language=request.text_language,
+                        prompt_language=request.prompt_language,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        temperature=request.temperature,
+                        repetition_penalty=request.repetition_penalty,
+                        noise_scale=request.noise_scale,
+                        speed=request.speed,
+                        stream_chunk=request.stream_chunk,
+                        overlap_len=request.overlap_len,
+                        boost_first_chunk=request.boost_first_chunk,
+                        debug=False,
+                    ):
+                        loop.call_soon_threadsafe(chunk_queue.put_nowait, clip)
+                except Exception as e:
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+                finally:
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+            loop.run_in_executor(None, stream_infer)
+
+            total_len = 0
+            while True:
+                clip = await chunk_queue.get()
+                if clip is None:
+                    break
+                if isinstance(clip, Exception):
+                    raise clip
+                audio_b64 = base64.b64encode(clip.audio_data.tobytes()).decode("utf-8")
+                total_len += len(clip.audio_data)
+                chunk_data = {
+                    "audio": audio_b64,
+                    "sample_rate": clip.samplerate,
+                    "duration": clip.audio_len_s,
+                    "text": clip.orig_text,
+                }
+                yield f"event: audio\ndata: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+
+            yield f"event: done\ndata: {json.dumps({'total_duration': total_len / 32000}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
