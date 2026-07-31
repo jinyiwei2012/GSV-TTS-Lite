@@ -831,7 +831,7 @@ class MultiSpeakerTTS:
         """
         # For now, decompose text into segments and infer each segment
         from .TextProcessor import cut_text
-        segments = cut_text(text, self._tts)
+        segments = cut_text(text)
         for seg_text in segments:
             yield self.infer(
                 speaker=speaker,
