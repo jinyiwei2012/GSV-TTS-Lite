@@ -375,6 +375,7 @@ def tts_request(
     enable_enhance,
     is_cut_text, cut_minlen, cut_mute, cut_mute_scale_map,
     sovits_batch_size,
+    text_language, prompt_language,
     mode, multi_cur_speaker,
 ):
     """Unified TTS inference — routes to single-model or multi-speaker engine."""
@@ -387,6 +388,7 @@ def tts_request(
                 multi_cur_speaker, text,
                 top_k, top_p, temperature, rep_penalty, noise_scale, speed,
                 enable_enhance, start_time,
+                text_language, prompt_language,
             )
 
         # ── Single-model mode (original logic) ──
@@ -424,6 +426,8 @@ def tts_request(
             prompt_audio_paths=prompt_audio_paths,
             prompt_audio_texts=prompt_audio_texts,
             texts=texts,
+            text_languages=text_language,
+            prompt_languages=prompt_language,
             is_cut_text=is_cut_text,
             cut_minlen=cut_minlen,
             cut_mute=cut_mute,
@@ -480,7 +484,8 @@ def tts_request(
 
 
 def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
-                     noise_scale, speed, enable_enhance, start_time):
+                     noise_scale, speed, enable_enhance, start_time,
+                     text_language="auto", prompt_language="auto"):
     """Multi-speaker inference backend (called from tts_request)."""
     # Parse <speaker:name> tags for multi-speaker mixing
     tagged = re.findall(r'<speaker:([^>]+)>(.*?)</speaker>', text, re.DOTALL)
@@ -506,7 +511,9 @@ def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
                 seen.add(key)
                 ordered.append(st)
 
-        audios = multi_tts.infer_batched(ordered, top_k=top_k, top_p=top_p,
+        audios = multi_tts.infer_batched(ordered, text_languages=text_language,
+                                         prompt_languages=prompt_language,
+                                         top_k=top_k, top_p=top_p,
                                          temperature=temperature,
                                          repetition_penalty=rep_penalty,
                                          noise_scale=noise_scale, speed=speed)
@@ -514,7 +521,10 @@ def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
         audio_data = np.concatenate([a.audio_data for a in audios])
         audio_len_s = sum(a.audio_len_s for a in audios)
     else:
-        audio = multi_tts.infer(speaker=speaker, text=text, top_k=top_k, top_p=top_p,
+        audio = multi_tts.infer(speaker=speaker, text=text,
+                                text_language=text_language,
+                                prompt_language=prompt_language,
+                                top_k=top_k, top_p=top_p,
                                 temperature=temperature,
                                 repetition_penalty=rep_penalty,
                                 noise_scale=noise_scale, speed=speed)
@@ -539,6 +549,95 @@ def _tts_multi_infer(speaker, text, top_k, top_p, temperature, rep_penalty,
     history_entry = [datetime.now().strftime("%H:%M:%S"), text[:20] + "...", str(save_path)]
 
     return (samplerate, audio_data), msg, history_entry
+
+
+def tts_stream_request(
+    multi_spk_files, spk_weights,
+    prompt_audio, prompt_text,
+    text,
+    top_k, top_p, temperature, rep_penalty, noise_scale, speed,
+    enable_enhance,
+    text_language, prompt_language,
+    mode, multi_cur_speaker,
+):
+    """Streaming inference (generator) — token-level streaming for both engines.
+
+    Single-model mode uses TTS.infer_stream; multi-speaker mode uses the
+    MultiSpeakerTTS.infer_stream (shared backbone, token-level streaming).
+    Yields (audio, status) progressively so Gradio renders chunks in real time.
+    """
+    def gen():
+        try:
+            if mode == "多角色" and multi_tts is not None:
+                if "<speaker:" in text:
+                    yield None, "⚠️ 混合角色标签 (<speaker:>) 暂不支持流式合成，请使用普通合成", None
+                    return
+                stream_gen = multi_tts.infer_stream(
+                    speaker=multi_cur_speaker,
+                    text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
+                    top_k=top_k, top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=rep_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    debug=False,
+                )
+            else:
+                spk_audio = parse_speaker_weights(multi_spk_files, spk_weights)
+                stream_gen = tts.infer_stream(
+                    spk_audio_path=spk_audio,
+                    prompt_audio_path=prompt_audio,
+                    prompt_audio_text=prompt_text,
+                    text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
+                    top_k=top_k, top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=rep_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    debug=False,
+                )
+
+            start_time = time.time()
+            chunks = []
+            for i, chunk in enumerate(stream_gen):
+                chunks.append(chunk)
+                total_s = sum(c.audio_len_s for c in chunks)
+                yield (chunk.samplerate, chunk.audio_data), f"⚡ 流式生成中... 已输出 {i + 1} 段 (累计 {total_s:.2f}s)", None
+
+            if not chunks:
+                yield None, "⚠️ 未生成任何音频", None
+                return
+
+            samplerate = chunks[0].samplerate
+            audio_data = np.concatenate([c.audio_data for c in chunks])
+            audio_len_s = sum(c.audio_len_s for c in chunks)
+
+            if enable_enhance:
+                audio_data = enhance_audio(audio_data, samplerate)
+
+            infer_duration = time.time() - start_time
+            rtf = infer_duration / audio_len_s if audio_len_s > 0 else 0
+            msg = (f"✅ 流式合成成功\n"
+                   f"音频时长: {audio_len_s:.2f}s | "
+                   f"推理耗时: {infer_duration:.2f}s | RTF: {rtf:.3f}")
+
+            filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.wav"
+            save_path = HISTORY_DIR / filename
+            import soundfile as sf
+            sf.write(str(save_path), audio_data, samplerate)
+            history_entry = [datetime.now().strftime("%H:%M:%S"), text[:20] + "...", str(save_path)]
+
+            yield (samplerate, audio_data), msg, history_entry
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield None, f"异常: {str(e)}", None
+
+    return gen()
 
 
 # --- UI 界面 ---
@@ -627,6 +726,17 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                         top_p = gr.Slider(0.1, 1.0, 1.0, label="Top P")
                         rep_penalty = gr.Slider(1.0, 2.0, 1.35, label="重复惩罚")
                         sovits_batch_size = gr.Number(label="SoVITS最大并行推理大小", value=10)
+                        text_language = gr.Dropdown(
+                            choices=["auto", "ja", "zh", "en"],
+                            value="auto",
+                            label="目标文本语言",
+                            info="auto 自动检测；混语文本建议手动指定",
+                        )
+                        prompt_language = gr.Dropdown(
+                            choices=["auto", "ja", "zh", "en"],
+                            value="auto",
+                            label="参考音频文本语言",
+                        )
                         is_cut_text = gr.Checkbox(label="是否切分文本", value=True)
                         cut_minlen = gr.Number(label="最小切分长度", value=10)
                         cut_mute = gr.Number(label="切分静音时长(s)", value=0.3)
@@ -649,7 +759,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
             # ============ 推理输出（共享） ============
             with gr.Group():
-                btn = gr.Button("🔥 开始语音合成", variant="primary", size="lg")
+                with gr.Row():
+                    btn = gr.Button("🔥 开始语音合成", variant="primary", size="lg", scale=3)
+                    stream_btn = gr.Button("⚡ 流式合成", variant="secondary", size="lg", scale=1)
                 with gr.Row():
                     with gr.Column(scale=2):
                         output_audio = gr.Audio(label="生成的音频结果")
@@ -789,6 +901,25 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             enable_enhance,
             is_cut_text, cut_minlen, cut_mute, cut_mute_scale_map,
             sovits_batch_size,
+            text_language, prompt_language,
+            tts_mode, multi_cur_speaker,
+        ],
+        outputs=[output_audio, log_output, temp_history_entry]
+    ).then(
+        fn=update_history,
+        inputs=[temp_history_entry, history_state],
+        outputs=[history_state, history_display]
+    )
+
+    stream_btn.click(
+        fn=tts_stream_request,
+        inputs=[
+            multi_spk_files, spk_weights,
+            prompt_audio, prompt_text,
+            text,
+            top_k, top_p, temperature, rep_penalty, noise_scale, speed,
+            enable_enhance,
+            text_language, prompt_language,
             tts_mode, multi_cur_speaker,
         ],
         outputs=[output_audio, log_output, temp_history_entry]
@@ -930,7 +1061,7 @@ if __name__ == "__main__":
         models_dir=args.models_dir,
     )
     
-    demo.launch(
+    demo.queue().launch(
         server_port=args.port,
         share=args.share,
         inbrowser=True
