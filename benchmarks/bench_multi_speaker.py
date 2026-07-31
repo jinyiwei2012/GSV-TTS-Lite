@@ -25,6 +25,8 @@ N_AVG = 2
 SPEAKERS = [
     ("cyrene",    "CyreneV3.7-e25.ckpt",       "CyreneV3.7_e16_s1392.pth"),
     ("shouanren", "shouanren-e20.ckpt",        "shouanren_e24_s1584.pth"),
+    ("luotianyi", r"D:\Agent-LuoTianyi\server\res\tts\luotianyi\custom_models\lty-tts_gpt_model.ckpt",
+                  r"D:\Agent-LuoTianyi\server\res\tts\luotianyi\custom_models\lty-tts_sovits_model.pth"),
 ]
 
 SPK_AUDIO = "examples/laffey.mp3"
