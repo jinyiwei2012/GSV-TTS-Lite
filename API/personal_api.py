@@ -30,7 +30,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, Response, JSONResponse
 from pydantic import BaseModel, Field
 
-from gsv_tts import TTS
+from gsv_tts import TTS, MultiSpeakerTTS, SpeakerConfig, ConfigMismatchError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,6 +96,7 @@ output_dir = project_root / "output"
 output_dir.mkdir(exist_ok=True)
 
 tts: Optional[TTS] = None
+multi_tts: Optional[MultiSpeakerTTS] = None
 asr = None
 temp_dir = tempfile.mkdtemp(prefix="gsv_tts_personal_")
 use_asr_flag = True
@@ -441,6 +442,67 @@ class TTSBatchedRequest(BaseModel):
     speed: float = Field(1.0, description="语速")
 
 
+# ============================================================
+# Multi-Speaker 多角色推理
+# ============================================================
+
+class MultiInitRequest(BaseModel):
+    base_gpt_path: Optional[str] = Field(None, description="共享骨干 GPT 模型路径，默认 s1v3.ckpt")
+    base_sovits_path: Optional[str] = Field(None, description="共享骨干 SoVITS 模型路径，默认 s2Gv2ProPlus.pth")
+    use_bert: bool = Field(True, description="预加载中文 BERT")
+    use_flash_attn: bool = Field(False, description="启用 Flash Attention")
+
+
+class MultiAddSpeakerRequest(BaseModel):
+    name: str = Field(..., description="角色唯一标识")
+    gpt_model_path: str = Field(..., description="角色微调 GPT 模型路径")
+    sovits_model_path: str = Field(..., description="角色微调 SoVITS 模型路径")
+    speaker_audio: str = Field(..., description="音色参考音频路径或URL")
+    prompt_audio: Optional[str] = Field(None, description="风格参考音频路径或URL，默认复用 speaker_audio")
+    prompt_text: Optional[str] = Field(None, description="风格参考音频文本")
+
+
+class MultiRemoveSpeakerRequest(BaseModel):
+    name: str = Field(..., description="要移除的角色名")
+
+
+class MultiInferRequest(BaseModel):
+    speaker: str = Field(..., description="角色名")
+    text: str = Field(..., description="要合成的文本")
+    text_language: str = Field("auto", description="目标文本语言: auto/ja/zh/en")
+    prompt_language: str = Field("auto", description="提示音频文本语言: auto/ja/zh/en")
+    prompt_audio_path: Optional[str] = Field(None, description="按次覆盖风格参考音频路径")
+    prompt_audio_text: Optional[str] = Field(None, description="按次覆盖风格参考音频文本")
+    top_k: int = Field(15, description="GPT采样top_k")
+    top_p: float = Field(1.0, description="GPT采样top_p")
+    temperature: float = Field(1.0, description="GPT采样温度")
+    repetition_penalty: float = Field(1.35, description="重复惩罚")
+    noise_scale: float = Field(0.5, description="噪声强度")
+    speed: float = Field(1.0, description="语速")
+
+
+class MultiBatchRequest(BaseModel):
+    speaker_texts: list[MultiInferRequest] = Field(..., description="(speaker, text) 列表，每条可独立指定语言与 prompt 覆盖")
+
+
+class MultiStreamRequest(BaseModel):
+    speaker: str = Field(..., description="角色名")
+    text: str = Field(..., description="要合成的文本")
+    text_language: str = Field("auto", description="目标文本语言: auto/ja/zh/en")
+    prompt_language: str = Field("auto", description="提示音频文本语言: auto/ja/zh/en")
+    prompt_audio_path: Optional[str] = Field(None, description="按次覆盖风格参考音频路径")
+    prompt_audio_text: Optional[str] = Field(None, description="按次覆盖风格参考音频文本")
+    top_k: int = Field(15, description="GPT采样top_k")
+    top_p: float = Field(1.0, description="GPT采样top_p")
+    temperature: float = Field(1.0, description="GPT采样温度")
+    repetition_penalty: float = Field(1.35, description="重复惩罚")
+    noise_scale: float = Field(0.5, description="噪声强度")
+    speed: float = Field(1.0, description="语速")
+    stream_chunk: int = Field(25, description="token模式下每次生成的token数")
+    overlap_len: int = Field(5, description="重叠长度，用于平滑拼接")
+    boost_first_chunk: bool = Field(True, description="是否加速首个chunk生成")
+
+
 class APIV2Request(BaseModel):
     text: Union[str, list[str], None] = None
     text_lang: Optional[str] = None
@@ -477,11 +539,13 @@ async def root():
         "endpoints": {
             "stream": "/tts/stream - 流式推理 (SSE)",
             "batched": "/tts/batched - 批量推理",
-            "audio": "/audio/{filename} - 获取音频文件"
+            "audio": "/audio/{filename} - 获取音频文件",
+            "multi_speaker": "/multi-speaker/init|add|remove|list|infer|batch|stream - 多角色推理",
         },
         "features": {
             "url_support": True,
-            "auto_asr": asr is not None
+            "auto_asr": asr is not None,
+            "multi_speaker": multi_tts is not None,
         }
     }
 
@@ -789,6 +853,287 @@ async def get_audio(filename: str):
     if not file_path.is_file():
         raise HTTPException(status_code=400, detail="Not a file")
     return FileResponse(str(file_path), media_type="audio/wav")
+
+
+# ============================================================
+# Multi-Speaker 多角色推理端点
+# ============================================================
+
+@app.post("/multi-speaker/init")
+async def multi_init(request: MultiInitRequest):
+    """初始化 MultiSpeakerTTS 引擎（共享骨干）。"""
+    global multi_tts
+    try:
+        kwargs = {
+            "speakers": [],
+            "use_bert": request.use_bert,
+            "use_flash_attn": request.use_flash_attn,
+        }
+        if request.base_gpt_path:
+            kwargs["base_gpt_path"] = request.base_gpt_path
+        if request.base_sovits_path:
+            kwargs["base_sovits_path"] = request.base_sovits_path
+
+        multi_tts = MultiSpeakerTTS(**kwargs)
+        return {"success": True, "message": "MultiSpeakerTTS engine initialized"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/add")
+async def multi_add(request: MultiAddSpeakerRequest):
+    """添加角色到 MultiSpeakerTTS 引擎。"""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="MultiSpeakerTTS not initialized. Call /multi-speaker/init first.")
+
+    try:
+        speaker_audio = resolve_audio_path(request.speaker_audio)
+        prompt_audio = resolve_audio_path(request.prompt_audio) if request.prompt_audio else None
+
+        if is_url(speaker_audio):
+            speaker_audio = await download_audio(speaker_audio)
+        if prompt_audio and is_url(prompt_audio):
+            prompt_audio = await download_audio(prompt_audio)
+
+        spk = SpeakerConfig(
+            name=request.name,
+            gpt_model_path=request.gpt_model_path,
+            sovits_model_path=request.sovits_model_path,
+            spk_audio_path=speaker_audio,
+            prompt_audio_path=prompt_audio or speaker_audio,
+            prompt_audio_text=request.prompt_text,
+        )
+        multi_tts.add_speaker(spk)
+        w = multi_tts._speakers[request.name]
+        mode = "shared" if not w.is_full_model else "full_model_degraded"
+
+        return {
+            "success": True,
+            "name": request.name,
+            "mode": mode,
+            "message": f"Speaker '{request.name}' added ({mode})",
+        }
+    except ConfigMismatchError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Config mismatch (speaker loaded as full model): {e}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/remove")
+async def multi_remove(request: MultiRemoveSpeakerRequest):
+    """从 MultiSpeakerTTS 引擎移除角色。"""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        multi_tts.remove_speaker(request.name)
+        return {"success": True, "message": f"Speaker '{request.name}' removed"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/multi-speaker/list")
+async def multi_list():
+    """列出所有已加载角色及其模式。"""
+    global multi_tts
+    if multi_tts is None:
+        return {"initialized": False, "speakers": []}
+
+    speakers = []
+    for name in multi_tts.speaker_names:
+        w = multi_tts._speakers[name]
+        speakers.append({
+            "name": name,
+            "mode": "full_model" if w.is_full_model else "shared",
+            "gpt_keys": len(w.gpt_weights) if not w.is_full_model else 0,
+            "sovits_keys": len(w.sovits_weights) if not w.is_full_model else 0,
+        })
+
+    return {"initialized": True, "speakers": speakers}
+
+
+@app.post("/multi-speaker/infer")
+async def multi_infer(request: MultiInferRequest):
+    """单角色推理。"""
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        audio_clip = multi_tts.infer(
+            speaker=request.speaker,
+            text=request.text,
+            prompt_audio_path=request.prompt_audio_path,
+            prompt_audio_text=request.prompt_audio_text,
+            text_language=request.text_language,
+            prompt_language=request.prompt_language,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            temperature=request.temperature,
+            repetition_penalty=request.repetition_penalty,
+            noise_scale=request.noise_scale,
+            speed=request.speed,
+        )
+
+        filename = f"multi_{uuid.uuid4().hex[:8]}.wav"
+        output_path = output_dir / filename
+        audio_clip.save(str(output_path))
+
+        return {
+            "success": True,
+            "speaker": request.speaker,
+            "audio_len": audio_clip.audio_len_s,
+            "filename": filename,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/batch")
+async def multi_batch(request: MultiBatchRequest):
+    """多角色批量推理。
+
+    Example body:
+    {
+        "speaker_texts": [
+            {"speaker": "alice", "text": "こんにちは", "text_language": "ja"},
+            {"speaker": "bob",   "text": "你好", "text_language": "zh"}
+        ]
+    }
+    """
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    try:
+        speaker_texts = [(r.speaker, r.text) for r in request.speaker_texts]
+
+        # 语言参数：所有条目相同则传单个 str，否则逐条传 list
+        text_languages = [r.text_language for r in request.speaker_texts]
+        prompt_languages = [r.prompt_language for r in request.speaker_texts]
+        if len(set(text_languages)) == 1:
+            text_languages = text_languages[0]
+        if len(set(prompt_languages)) == 1:
+            prompt_languages = prompt_languages[0]
+
+        batch_kwargs = {
+            "text_languages": text_languages,
+            "prompt_languages": prompt_languages,
+        }
+
+        # 按次 prompt 覆盖：任一条目提供了覆盖参数时逐条透传（自动退化为逐条推理）
+        prompt_paths = [r.prompt_audio_path for r in request.speaker_texts]
+        prompt_texts = [r.prompt_audio_text for r in request.speaker_texts]
+        if any(prompt_paths) or any(prompt_texts):
+            batch_kwargs["prompt_audio_paths"] = prompt_paths
+            batch_kwargs["prompt_audio_texts"] = prompt_texts
+
+        audio_clips = multi_tts.infer_batched(speaker_texts, **batch_kwargs)
+
+        filenames = []
+        for clip in audio_clips:
+            filename = f"multi_{uuid.uuid4().hex[:8]}.wav"
+            output_path = output_dir / filename
+            clip.save(str(output_path))
+            filenames.append(filename)
+
+        return {
+            "success": True,
+            "count": len(audio_clips),
+            "filenames": filenames,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/multi-speaker/stream")
+async def multi_stream(request: MultiStreamRequest):
+    """多角色流式推理 (SSE)。
+
+    返回格式 (Server-Sent Events)：
+    - event: audio - 音频片段 (base64 编码 WAV)
+    - event: done  - 生成完成 (total_duration)
+    - event: error - 错误信息
+    """
+    global multi_tts
+    if multi_tts is None:
+        raise HTTPException(status_code=400, detail="Not initialized")
+
+    async def generate():
+        try:
+            loop = asyncio.get_running_loop()
+            chunk_queue: asyncio.Queue = asyncio.Queue()
+
+            def stream_infer():
+                try:
+                    for clip in multi_tts.infer_stream(
+                        speaker=request.speaker,
+                        text=request.text,
+                        prompt_audio_path=request.prompt_audio_path,
+                        prompt_audio_text=request.prompt_audio_text,
+                        text_language=request.text_language,
+                        prompt_language=request.prompt_language,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        temperature=request.temperature,
+                        repetition_penalty=request.repetition_penalty,
+                        noise_scale=request.noise_scale,
+                        speed=request.speed,
+                        stream_chunk=request.stream_chunk,
+                        overlap_len=request.overlap_len,
+                        boost_first_chunk=request.boost_first_chunk,
+                        debug=False,
+                    ):
+                        loop.call_soon_threadsafe(chunk_queue.put_nowait, clip)
+                except Exception as e:
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+                finally:
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+
+            loop.run_in_executor(None, stream_infer)
+
+            total_len = 0
+            while True:
+                clip = await chunk_queue.get()
+                if clip is None:
+                    break
+                if isinstance(clip, Exception):
+                    raise clip
+                audio_b64 = base64.b64encode(clip.audio_data.tobytes()).decode("utf-8")
+                total_len += len(clip.audio_data)
+                chunk_data = {
+                    "audio": audio_b64,
+                    "sample_rate": clip.samplerate,
+                    "duration": clip.audio_len_s,
+                    "text": clip.orig_text,
+                }
+                yield f"event: audio\ndata: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+
+            yield f"event: done\ndata: {json.dumps({'total_duration': total_len / 32000}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logging.error(f"多角色流式推理错误: {e}")
+            yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
