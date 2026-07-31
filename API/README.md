@@ -290,6 +290,7 @@ A: 可以手动提供 `prompt_text` 参数，或者确保 `prompt_audio` 音质�
 | GET  | `/multi-speaker/list` | 列出已加载角色 |
 | POST | `/multi-speaker/infer` | 单角色推理 |
 | POST | `/multi-speaker/batch` | 多角色批量推理 |
+| POST | `/multi-speaker/stream` | 单角色流式推理 (SSE) 🆕 |
 
 ### 使用流程
 
@@ -337,10 +338,13 @@ curl -X POST "http://localhost:8000/multi-speaker/infer" \
     "speaker": "alice",
     "text": "こんにちは！",
     "text_language": "ja",
-    "prompt_language": "ja"
+    "prompt_language": "ja",
+    "prompt_audio_path": "audio/other_style.ogg",
+    "prompt_audio_text": "別のスタイルのテキスト。"
   }'
 ```
 > `text_language` / `prompt_language` 可选，支持 `"auto"` / `"ja"` / `"zh"` / `"en"`。
+> `prompt_audio_path` / `prompt_audio_text` 可选，用于**按次覆盖**角色默认的风格参考音频（不传则使用添加角色时的配置）。
 
 **5. 多角色批量推理**
 ```bash
@@ -353,7 +357,32 @@ curl -X POST "http://localhost:8000/multi-speaker/batch" \
     ]
   }'
 ```
-> 相同角色自动 GPU 并行，不同角色按组分别批量处理。每条可独立指定 `text_language` / `prompt_language`，全部相同时也可省略（默认 `"auto"`）。
+> 相同角色自动 GPU 并行，不同角色按组分别批量处理。每条可独立指定 `text_language` / `prompt_language` / `prompt_audio_path` / `prompt_audio_text`，全部相同时也可省略（默认 `"auto"` / 不覆盖）。任一条目提供 prompt 覆盖时自动退化为逐条推理。
+
+**6. 单角色流式推理 (SSE)** 🆕
+```bash
+curl -N -X POST "http://localhost:8000/multi-speaker/stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker": "alice",
+    "text": "こんにちは！長いテキストでも低遅延で読み上げます。",
+    "text_language": "ja",
+    "stream_chunk": 25,
+    "overlap_len": 5
+  }'
+```
+返回格式与 `/tts/stream` 一致（Server-Sent Events）：
+```
+event: audio
+data: {"audio": "<base64>", "sample_rate": 32000, "duration": 0.5, "text": "..."}
+
+event: done
+data: {"total_duration": 5.2}
+
+event: error
+data: {"error": "错误信息"}
+```
+> 基于 `MultiSpeakerTTS.infer_stream` 的 Token 级流式输出，共享骨干 + 角色权重单次注入，首包延迟与单模型流式一致。
 
 ### 自动兼容性
 
