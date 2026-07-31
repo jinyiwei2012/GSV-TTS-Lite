@@ -573,6 +573,8 @@ class MultiSpeakerTTS:
         text: str,
         prompt_audio_path: str | None = None,
         prompt_audio_text: str | None = None,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
@@ -588,6 +590,8 @@ class MultiSpeakerTTS:
             text: Text to synthesize.
             prompt_audio_path: Override prompt audio for style reference.
             prompt_audio_text: Override prompt audio transcription.
+            text_language: Language of the target text ("auto", "ja", "zh", "en").
+            prompt_language: Language of the prompt audio text ("auto", "ja", "zh", "en").
             return_subtitles: Return word-level timestamp subtitles.
             top_k, top_p, temperature: GPT sampling parameters.
             repetition_penalty: GPT repetition penalty.
@@ -629,6 +633,8 @@ class MultiSpeakerTTS:
                     prompt_audio_path=prompt_audio_path,
                     prompt_audio_text=prompt_audio_text,
                     text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
                     return_subtitles=return_subtitles,
                     top_k=top_k,
                     top_p=top_p,
@@ -660,6 +666,8 @@ class MultiSpeakerTTS:
                     prompt_audio_path=prompt_audio_path,
                     prompt_audio_text=prompt_audio_text,
                     text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
                     return_subtitles=return_subtitles,
                     top_k=top_k,
                     top_p=top_p,
@@ -676,6 +684,8 @@ class MultiSpeakerTTS:
         speaker_texts: list[tuple[str, str]],
         prompt_audio_paths: str | list[str] | None = None,
         prompt_audio_texts: str | list[str] | None = None,
+        text_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
+        prompt_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
         return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
@@ -752,6 +762,12 @@ class MultiSpeakerTTS:
                             text=texts[i],
                             prompt_audio_path=pp,
                             prompt_audio_text=pt,
+                            text_language=text_languages
+                            if isinstance(text_languages, str)
+                            else text_languages[orig_idx],
+                            prompt_language=prompt_languages
+                            if isinstance(prompt_languages, str)
+                            else prompt_languages[orig_idx],
                             return_subtitles=return_subtitles,
                             top_k=top_k, top_p=top_p, temperature=temperature,
                             repetition_penalty=repetition_penalty,
@@ -775,6 +791,12 @@ class MultiSpeakerTTS:
                                 all_results[orig_idx] = self.infer(
                                     speaker=speaker,
                                     text=texts[i],
+                                    text_language=text_languages
+                                    if isinstance(text_languages, str)
+                                    else text_languages[orig_idx],
+                                    prompt_language=prompt_languages
+                                    if isinstance(prompt_languages, str)
+                                    else prompt_languages[orig_idx],
                                     return_subtitles=return_subtitles,
                                     top_k=top_k, top_p=top_p, temperature=temperature,
                                     repetition_penalty=repetition_penalty,
@@ -786,6 +808,12 @@ class MultiSpeakerTTS:
                                 prompt_audio_paths=prompt_key,
                                 prompt_audio_texts=prompt_text,
                                 texts=texts,
+                                text_languages=text_languages
+                                if isinstance(text_languages, str)
+                                else [text_languages[oi] for oi in orig_indices],
+                                prompt_languages=prompt_languages
+                                if isinstance(prompt_languages, str)
+                                else [prompt_languages[oi] for oi in orig_indices],
                                 return_subtitles=return_subtitles,
                                 top_k=top_k, top_p=top_p, temperature=temperature,
                                 repetition_penalty=repetition_penalty,
@@ -806,43 +834,143 @@ class MultiSpeakerTTS:
         text: str,
         prompt_audio_path: str | None = None,
         prompt_audio_text: str | None = None,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        return_subtitles: bool = False,
+        is_cut_text: bool = True,
+        cut_minlen: int = 10,
+        cut_mute: float = 0.4,
+        cut_mute_scale_map: dict[str, float] | None = None,
+        stream_mode: Literal["token", "sentence"] = "token",
         stream_chunk: int = 25,
         overlap_len: int = 5,
+        boost_first_chunk: bool = True,
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
         repetition_penalty: float = 1.35,
         noise_scale: float = 0.5,
         speed: float = 1.0,
-        return_subtitles: bool = False,
         debug: bool = False,
     ) -> Generator[AudioClip, None, None]:
-        """Streaming inference — yields audio chunks as they are generated.
+        """Streaming inference — token-level streaming via the shared backbone.
 
-        Currently falls back to non-streaming infer() per text segment.
-        Full streaming with per-chunk weight injection will be added later.
+        Delegates to TTS.infer_stream() after registering speaker resources:
+        the shared GPT/SoVITS models are activated and speaker weights are
+        injected once (via copy_()) before the stream starts, so every yielded
+        chunk is generated token-by-token with the same low latency as TTS.
 
         Args:
             speaker: Speaker name.
             text: Text to synthesize.
-            stream_chunk: Token count per streaming chunk.
-            overlap_len: Overlap tokens between chunks.
-            ... (other args same as infer())
+            prompt_audio_path: Override prompt audio (tone/style reference).
+            prompt_audio_text: Override prompt audio transcription.
+            ... (other args match TTS.infer_stream)
+
+        Yields:
+            AudioClip chunks as they are generated (streaming).
         """
-        # For now, decompose text into segments and infer each segment
-        from .TextProcessor import cut_text
-        segments = cut_text(text)
-        for seg_text in segments:
-            yield self.infer(
-                speaker=speaker,
-                text=seg_text,
-                prompt_audio_path=prompt_audio_path,
-                prompt_audio_text=prompt_audio_text,
-                return_subtitles=return_subtitles,
-                top_k=top_k, top_p=top_p, temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                noise_scale=noise_scale, speed=speed,
+        with self._tts._infer_lock:
+            w = self._require_speaker(speaker)
+
+            if w.is_full_model:
+                # Full-model speaker — no weight injection needed
+                require_prompt = (
+                    prompt_audio_path is None or prompt_audio_text is None
+                )
+                (
+                    spk_key,
+                    prompt_key,
+                    cached_prompt_text,
+                    gpt_key,
+                    sovits_key,
+                ) = self._register_full_model_cache(
+                    speaker, require_prompt=require_prompt
+                )
+
+                if prompt_audio_path is None and prompt_audio_text is None:
+                    prompt_audio_path = prompt_key
+                    prompt_audio_text = cached_prompt_text
+                elif prompt_audio_path is None or prompt_audio_text is None:
+                    raise ValueError(
+                        "prompt_audio_path and prompt_audio_text "
+                        "must be provided together."
+                    )
+
+                yield from self._tts.infer_stream(
+                    spk_audio_path=spk_key,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
+                    return_subtitles=return_subtitles,
+                    is_cut_text=is_cut_text,
+                    cut_minlen=cut_minlen,
+                    cut_mute=cut_mute,
+                    cut_mute_scale_map=cut_mute_scale_map,
+                    stream_mode=stream_mode,
+                    stream_chunk=stream_chunk,
+                    overlap_len=overlap_len,
+                    boost_first_chunk=boost_first_chunk,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    gpt_model=gpt_key,
+                    sovits_model=sovits_key,
+                    debug=debug,
+                )
+                return
+
+            # Shared-backbone speaker — inject weights + use shared models
+            require_prompt = (
+                prompt_audio_path is None or prompt_audio_text is None
             )
+            with self._activate_shared_models(
+                speaker, require_prompt=require_prompt
+            ) as (
+                spk_key,
+                prompt_key,
+                cached_prompt_text,
+            ):
+                if prompt_audio_path is None and prompt_audio_text is None:
+                    prompt_audio_path = prompt_key
+                    prompt_audio_text = cached_prompt_text
+                elif prompt_audio_path is None or prompt_audio_text is None:
+                    raise ValueError(
+                        "prompt_audio_path and prompt_audio_text "
+                        "must be provided together."
+                    )
+
+                yield from self._tts.infer_stream(
+                    spk_audio_path=spk_key,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
+                    return_subtitles=return_subtitles,
+                    is_cut_text=is_cut_text,
+                    cut_minlen=cut_minlen,
+                    cut_mute=cut_mute,
+                    cut_mute_scale_map=cut_mute_scale_map,
+                    stream_mode=stream_mode,
+                    stream_chunk=stream_chunk,
+                    overlap_len=overlap_len,
+                    boost_first_chunk=boost_first_chunk,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    noise_scale=noise_scale,
+                    speed=speed,
+                    gpt_model=_SHARED_GPT_KEY,
+                    sovits_model=_SHARED_SOVITS_KEY,
+                    debug=debug,
+                )
 
     def _empty_cache(self):
         """Release unused GPU memory."""
