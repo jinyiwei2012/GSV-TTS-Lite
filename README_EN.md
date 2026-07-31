@@ -166,6 +166,8 @@ audio = tts.infer(
     prompt_audio_path="examples\AnAn.ogg", # Style reference audio (Prompt)
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。", # The corresponding text for the style reference audio
     text="へぇー、ここまでしてくれるんですね。", # Target text to be generated
+    text_language="auto", # Language of the target text: "auto" / "ja" / "zh" / "en", auto-detected by default
+    prompt_language="auto", # Language of the prompt audio text: "auto" / "ja" / "zh" / "en", auto-detected by default
     # gpt_model = None, # Path to the GPT model for inference; defaults to the first loaded GPT model.
     # sovits_model = None, # Path to the SoVITS model for inference; defaults to the first loaded SoVITS model.
 )
@@ -227,6 +229,8 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    text_language="auto", # Language of the target text: "auto" / "ja" / "zh" / "en"
+    prompt_language="auto", # Language of the prompt audio text: "auto" / "ja" / "zh" / "en"
     stream_chunk = 25,
     overlap_len = 5,
     return_subtitles=True,
@@ -262,6 +266,8 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo’s trembling hands."],
+    text_languages="auto", # Language of the target texts; accepts str or per-sentence list[str]: "auto" / "ja" / "zh" / "en"
+    prompt_languages="auto", # Language of the prompt audio texts; accepts str or per-sentence list[str]: "auto" / "ja" / "zh" / "en"
     bert_batch_size=20,
     sovits_batch_size=10,
 )
@@ -306,14 +312,14 @@ print("Speaker Similarity:", similarity)
 ```python
 from gsv_tts import MultiSpeakerTTS, SpeakerConfig
 
-# Define multiple speakers
+# Define multiple speakers (model paths also support safetensors directory format)
 speakers = [
     SpeakerConfig(
         name="alice",
         gpt_model_path="models/alice_gpt.ckpt",
         sovits_model_path="models/alice_sovits.pth",
         spk_audio_path="audio/alice_ref.wav",
-        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_path="audio/alice_prompt.ogg",  # Optional, falls back to spk_audio_path
         prompt_audio_text="Hello, I'm Alice.",
     ),
     SpeakerConfig(
@@ -329,16 +335,39 @@ speakers = [
 # Load all speakers at once (shared backbone + per-speaker weights)
 tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
 
-# Single-speaker inference — auto-routed by speaker name
-audio = tts.infer("alice", "Good morning!")
+# Single-speaker inference — auto-routed by speaker name, supports language params and per-call prompt overrides
+audio = tts.infer(
+    "alice",
+    "Good morning!",
+    text_language="en",       # "auto" / "ja" / "zh" / "en"
+    prompt_language="en",     # "auto" / "ja" / "zh" / "en"
+    # prompt_audio_path="other_style.ogg",   # Optional: override the style reference audio for this call
+    # prompt_audio_text="Text for the other style.",  # Must be provided when overriding
+)
 audio.play()
 
-# Batch inference — true GPU parallelism for same-speaker texts
-audios = tts.infer_batched([
-    ("alice", "Hello"),
-    ("alice", "How are you?"),
-    ("bob",   "Nice to meet you"),
-])
+# Streaming inference — token-level streaming with the same low-latency real-time feedback as TTS.infer_stream
+for chunk in tts.infer_stream(
+    "alice",
+    "What a wonderful day it is!",
+    text_language="en",
+    stream_chunk=25,
+    overlap_len=5,
+    return_subtitles=True,
+):
+    chunk.play()
+
+tts.audio_queue.wait()
+
+# Batch inference — true GPU parallelism for same-speaker texts, supports per-sentence language lists
+audios = tts.infer_batched(
+    [
+        ("alice", "Hello"),
+        ("alice", "How are you?"),
+        ("bob",   "Nice to meet you"),
+    ],
+    text_languages=["en", "en", "en"],  # or just pass "auto"
+)
 
 # Runtime management
 tts.add_speaker(SpeakerConfig(name="charlie", ...))

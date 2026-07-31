@@ -166,6 +166,8 @@ audio = tts.infer(
     prompt_audio_path="examples\AnAn.ogg", # スタイル参照オーディオ
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。", # スタイル参照オーディオに対応するテキスト
     text="へぇー、ここまでしてくれるんですね。", # 生成対象テキスト
+    text_language="auto", # 対象テキストの言語："auto" / "ja" / "zh" / "en"、デフォルトは自動検出
+    prompt_language="auto", # 参照オーディオテキストの言語："auto" / "ja" / "zh" / "en"、デフォルトは自動検出
     # gpt_model = None, # 推論に使用する GPT モデルのパス。デフォルトでは最初にロードされた GPT モデルで推論します
     # sovits_model = None, # 推論に使用する SoVITS モデルのパス。デフォルトでは最初にロードされた SoVITS モデルで推論します
 )
@@ -227,6 +229,8 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    text_language="auto", # 対象テキストの言語："auto" / "ja" / "zh" / "en"
+    prompt_language="auto", # 参照オーディオテキストの言語："auto" / "ja" / "zh" / "en"
     stream_chunk = 25,
     overlap_len = 5,
     return_subtitles=True,
@@ -261,6 +265,8 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo's trembling hands."],
+    text_languages="auto", # 対象テキストの言語。str または文ごとの list[str] に対応："auto" / "ja" / "zh" / "en"
+    prompt_languages="auto", # 参照オーディオテキストの言語。str または文ごとの list[str] に対応："auto" / "ja" / "zh" / "en"
     bert_batch_size=20,
     sovits_batch_size=10,
 )
@@ -305,14 +311,14 @@ print("声紋類似度：", similarity)
 ```python
 from gsv_tts import MultiSpeakerTTS, SpeakerConfig
 
-# 複数のキャラクターを定義
+# 複数のキャラクターを定義（モデルパスは safetensors ディレクトリ形式にも対応）
 speakers = [
     SpeakerConfig(
         name="alice",
         gpt_model_path="models/alice_gpt.ckpt",
         sovits_model_path="models/alice_sovits.pth",
         spk_audio_path="audio/alice_ref.wav",
-        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_path="audio/alice_prompt.ogg",  # 省略可、デフォルトでは spk_audio_path を使用
         prompt_audio_text="こんにちは、アリスです。",
     ),
     SpeakerConfig(
@@ -328,16 +334,39 @@ speakers = [
 # すべてのキャラクターを一度にロード（共有骨格 + キャラクター専用の重み）
 tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
 
-# 単一キャラクター推論 — キャラクター名で自動ルーティング
-audio = tts.infer("alice", "今日も頑張りましょう！")
+# 単一キャラクター推論 — キャラクター名で自動ルーティング。言語パラメータと呼び出しごとの prompt 上書きに対応
+audio = tts.infer(
+    "alice",
+    "今日も頑張りましょう！",
+    text_language="ja",       # "auto" / "ja" / "zh" / "en"
+    prompt_language="ja",     # "auto" / "ja" / "zh" / "en"
+    # prompt_audio_path="other_style.ogg",   # 任意：スタイル参照オーディオをこの呼び出しでのみ上書き
+    # prompt_audio_text="別のスタイルのテキスト。",  # 上書き時は対応テキストも必須
+)
 audio.play()
 
-# バッチ推論 — 同じキャラクターは自動的に GPU 並列処理
-audios = tts.infer_batched([
-    ("alice", "こんにちは"),
-    ("alice", "お元気ですか"),
-    ("bob",   "よろしくお願いします"),
-])
+# ストリーミング推論 — Token レベルのストリーミング出力。TTS.infer_stream と同様に低遅延のリアルタイムフィードバックを実現
+for chunk in tts.infer_stream(
+    "alice",
+    "へぇー、ここまでしてくれるんですね。",
+    text_language="ja",
+    stream_chunk=25,
+    overlap_len=5,
+    return_subtitles=True,
+):
+    chunk.play()
+
+tts.audio_queue.wait()
+
+# バッチ推論 — 同じキャラクターは自動的に GPU 並列処理、文ごとの言語指定にも対応
+audios = tts.infer_batched(
+    [
+        ("alice", "こんにちは"),
+        ("alice", "お元気ですか"),
+        ("bob",   "よろしくお願いします"),
+    ],
+    text_languages=["ja", "ja", "ja"],  # または単に "auto" を渡す
+)
 
 # 実行時管理
 tts.add_speaker(SpeakerConfig(name="charlie", ...))

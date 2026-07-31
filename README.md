@@ -165,6 +165,8 @@ audio = tts.infer(
     prompt_audio_path="examples\AnAn.ogg", # 风格参考音频
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。", # 风格参考音频对应的文本
     text="へぇー、ここまでしてくれるんですね。", # 目标生成文本
+    text_language="auto", # 目标文本语言："auto" / "ja" / "zh" / "en"，默认自动检测
+    prompt_language="auto", # 参考音频文本语言："auto" / "ja" / "zh" / "en"，默认自动检测
     # gpt_model = None, # 用于推理的GPT模型路径，默认用第一个加载的GPT模型推理
     # sovits_model = None, # 用于推理的SoVITS模型路径，默认用第一个加载的SoVITS模型推理
 )
@@ -226,6 +228,8 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    text_language="auto", # 目标文本语言："auto" / "ja" / "zh" / "en"
+    prompt_language="auto", # 参考音频文本语言："auto" / "ja" / "zh" / "en"
     stream_chunk = 25,
     overlap_len = 5,
     return_subtitles=True,
@@ -260,6 +264,8 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo’s trembling hands."],
+    text_languages="auto", # 目标文本语言，支持 str 或逐句 list[str]："auto" / "ja" / "zh" / "en"
+    prompt_languages="auto", # 参考音频文本语言，支持 str 或逐句 list[str]："auto" / "ja" / "zh" / "en"
     bert_batch_size=20,
     sovits_batch_size=10,
 )
@@ -304,14 +310,14 @@ print("声纹相似度：", similarity)
 ```python
 from gsv_tts import MultiSpeakerTTS, SpeakerConfig
 
-# 定义多个角色
+# 定义多个角色（模型路径同样支持 safetensors 目录格式）
 speakers = [
     SpeakerConfig(
         name="alice",
         gpt_model_path="models/alice_gpt.ckpt",
         sovits_model_path="models/alice_sovits.pth",
         spk_audio_path="audio/alice_ref.wav",
-        prompt_audio_path="audio/alice_prompt.ogg",
+        prompt_audio_path="audio/alice_prompt.ogg",  # 可选，默认复用 spk_audio_path
         prompt_audio_text="こんにちは、アリスです。",
     ),
     SpeakerConfig(
@@ -327,16 +333,39 @@ speakers = [
 # 一次性加载所有角色（共享骨干 + 角色专属权重）
 tts = MultiSpeakerTTS(speakers=speakers, use_bert=True)
 
-# 单角色推理——根据角色名自动路由
-audio = tts.infer("alice", "今日も頑張りましょう！")
+# 单角色推理——根据角色名自动路由，支持语言参数与按次调用的 prompt 覆盖
+audio = tts.infer(
+    "alice",
+    "今日も頑張りましょう！",
+    text_language="ja",       # "auto" / "ja" / "zh" / "en"
+    prompt_language="ja",     # "auto" / "ja" / "zh" / "en"
+    # prompt_audio_path="other_style.ogg",   # 可选：临时覆盖风格参考音频
+    # prompt_audio_text="別のスタイルのテキスト。",  # 覆盖时需同步提供对应文本
+)
 audio.play()
 
-# 批量推理——相同角色自动 GPU 并行
-audios = tts.infer_batched([
-    ("alice", "こんにちは"),
-    ("alice", "お元気ですか"),
-    ("bob",   "よろしくお願いします"),
-])
+# 流式推理——Token 级流式输出，与 TTS.infer_stream 同样支持低延迟实时反馈
+for chunk in tts.infer_stream(
+    "alice",
+    "へぇー、ここまでしてくれるんですね。",
+    text_language="ja",
+    stream_chunk=25,
+    overlap_len=5,
+    return_subtitles=True,
+):
+    chunk.play()
+
+tts.audio_queue.wait()
+
+# 批量推理——相同角色自动 GPU 并行，支持逐句语言指定
+audios = tts.infer_batched(
+    [
+        ("alice", "こんにちは"),
+        ("alice", "お元気ですか"),
+        ("bob",   "よろしくお願いします"),
+    ],
+    text_languages=["ja", "ja", "ja"],  # 或直接传 "auto"
+)
 
 # 运行时管理
 tts.add_speaker(SpeakerConfig(name="charlie", ...))
