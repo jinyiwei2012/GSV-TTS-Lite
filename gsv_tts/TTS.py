@@ -1786,6 +1786,9 @@ class TTS:
         return f2_real, offset
     
     def _find_head_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=64000, margin=3200):
+        if audio.shape[0] < frame_length:
+            return 0  # 音频太短无法分析帧——不裁剪
+
         search_audio_head = audio[:search_len]
         frames_head = search_audio_head.unfold(0, frame_length, hop_length)
         rms_head = torch.sqrt(torch.mean(frames_head**2, dim=1))
@@ -1798,11 +1801,14 @@ class TTS:
             head_offset = head_frame_idx * hop_length
             head_offset = max(0, head_offset-margin)
         else:
-            head_offset = search_audio_head.shape[0]
-            
+            head_offset = 0  # 未检测到语音帧——不裁剪，避免把音频裁空
+        
         return head_offset
 
     def _find_tail_threshold_offsets(self, audio, threshold=0.01, frame_length=512, hop_length=256, search_len=64000, margin=3200):
+        if audio.shape[0] < frame_length:
+            return 0  # 音频太短无法分析帧——不裁剪
+
         search_audio_tail = audio[-search_len:]
         actual_len = search_audio_tail.shape[0]
         frames_tail = search_audio_tail.unfold(0, frame_length, hop_length)
@@ -1816,8 +1822,8 @@ class TTS:
             tail_offset = actual_len - (tail_frame_idx * hop_length)
             tail_offset = max(1, tail_offset-margin)
         else:
-            tail_offset = search_audio_tail.shape[0]
-            
+            tail_offset = 0  # 未检测到语音帧——不裁剪，避免把音频裁空
+        
         return tail_offset
     
     def _get_subtitles(self, word2ph, assign, speed, last_end_s = 0):
