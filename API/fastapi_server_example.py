@@ -144,6 +144,8 @@ class MultiInferRequest(BaseModel):
     text: str
     text_language: str = "auto"
     prompt_language: str = "auto"
+    prompt_audio_path: Optional[str] = None
+    prompt_audio_text: Optional[str] = None
     top_k: int = 5
     top_p: float = 0.9
     temperature: float = 1.0
@@ -466,6 +468,8 @@ async def multi_infer(request: MultiInferRequest):
         audio_clip = multi_tts.infer(
             speaker=request.speaker,
             text=request.text,
+            prompt_audio_path=request.prompt_audio_path,
+            prompt_audio_text=request.prompt_audio_text,
             text_language=request.text_language,
             prompt_language=request.prompt_language,
             top_k=request.top_k,
@@ -519,11 +523,19 @@ async def multi_batch(request: MultiBatchRequest):
         if len(set(prompt_languages)) == 1:
             prompt_languages = prompt_languages[0]
 
-        audio_clips = multi_tts.infer_batched(
-            speaker_texts,
-            text_languages=text_languages,
-            prompt_languages=prompt_languages,
-        )
+        batch_kwargs = {
+            "text_languages": text_languages,
+            "prompt_languages": prompt_languages,
+        }
+
+        # 按次 prompt 覆盖：任一条目提供了覆盖参数时逐条透传（自动退化为逐条推理）
+        prompt_paths = [r.prompt_audio_path for r in request.speaker_texts]
+        prompt_texts = [r.prompt_audio_text for r in request.speaker_texts]
+        if any(prompt_paths) or any(prompt_texts):
+            batch_kwargs["prompt_audio_paths"] = prompt_paths
+            batch_kwargs["prompt_audio_texts"] = prompt_texts
+
+        audio_clips = multi_tts.infer_batched(speaker_texts, **batch_kwargs)
 
         filenames = []
         for clip in audio_clips:
