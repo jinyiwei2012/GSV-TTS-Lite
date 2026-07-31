@@ -147,6 +147,101 @@ for filename in result["filenames"]:
 GET /audio/tts_abc12345.wav
 ```
 
+### 4. 多角色推理 (Multi-Speaker) 🆕
+
+在同一服务中加载多个微调角色，共享 GPT + SoVITS 模型骨干，每个角色仅注入 ~5-15% 专属权重，显存节省 50-75%。
+
+**端点列表：**
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/multi-speaker/init` | 初始化多角色引擎 |
+| POST | `/multi-speaker/add` | 添加角色 |
+| POST | `/multi-speaker/remove` | 移除角色 |
+| GET  | `/multi-speaker/list` | 列出已加载角色 |
+| POST | `/multi-speaker/infer` | 单角色推理 |
+| POST | `/multi-speaker/batch` | 多角色批量推理 |
+| POST | `/multi-speaker/stream` | 单角色流式推理 (SSE) |
+
+**使用流程：**
+
+**1. 初始化引擎**
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/init" \
+  -H "Content-Type: application/json" \
+  -d '{"use_bert": true, "use_flash_attn": false}'
+```
+
+**2. 添加角色**（`speaker_audio` / `prompt_audio` 支持本地路径或 URL）
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/add" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "alice",
+    "gpt_model_path": "models/alice_gpt.ckpt",
+    "sovits_model_path": "models/alice_sovits.pth",
+    "speaker_audio": "audio/alice_ref.wav",
+    "prompt_audio": "audio/alice_prompt.ogg",
+    "prompt_text": "こんにちは、アリスです。"
+  }'
+```
+> 响应返回 `mode`：`shared`（共享骨干）或 `full_model_degraded`（架构不兼容时自动降级为完整模型）。
+
+**3. 查看角色**
+```bash
+curl "http://localhost:8000/multi-speaker/list"
+```
+
+**4. 单角色推理**（支持语言参数与按次 prompt 覆盖）
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/infer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker": "alice",
+    "text": "こんにちは！",
+    "text_language": "ja",
+    "prompt_language": "ja",
+    "prompt_audio_path": "audio/other_style.ogg",
+    "prompt_audio_text": "別のスタイルのテキスト。"
+  }'
+```
+
+**5. 批量推理**（每条可独立指定语言）
+```bash
+curl -X POST "http://localhost:8000/multi-speaker/batch" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker_texts": [
+      {"speaker": "alice", "text": "こんにちは", "text_language": "ja"},
+      {"speaker": "bob",   "text": "你好", "text_language": "zh"}
+    ]
+  }'
+```
+
+**6. 流式推理 (SSE)** — Token 级流式输出，低延迟实时反馈
+```bash
+curl -N -X POST "http://localhost:8000/multi-speaker/stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker": "alice",
+    "text": "こんにちは！長いテキストでも低遅延で読み上げます。",
+    "text_language": "ja",
+    "stream_chunk": 25,
+    "overlap_len": 5
+  }'
+```
+返回 SSE 事件：
+```
+event: audio
+data: {"audio": "<base64>", "sample_rate": 32000, "duration": 0.5, "text": "..."}
+
+event: done
+data: {"total_duration": 5.2}
+
+event: error
+data: {"error": "错误信息"}
+```
+
 ## 功能特性
 
 ### 外链音频URL支持
@@ -174,6 +269,12 @@ USE_ASR=false python personal_api.py  # 禁用ASR
 
 - **token模式**：按token数量切分，延迟更低，适合实时对话
 - **sentence模式**：按句子切分，音频更连贯，适合长文本朗读
+
+### 多角色 (Multi-Speaker)
+
+- 共享骨干 + 角色专属权重（~5-15%），显存节省 50-75%
+- 角色模型架构不兼容时自动降级为完整模型加载
+- 支持按次调用覆盖角色默认的风格参考音频（`prompt_audio_path` / `prompt_audio_text`）
 
 ## 两种模式对比
 
