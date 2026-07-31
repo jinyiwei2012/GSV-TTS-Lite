@@ -12,7 +12,6 @@ from transformers import (
 )
 
 import torch.nn as nn
-import torch
 from ...Config import Config
 
 

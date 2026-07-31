@@ -5,6 +5,8 @@ from torch import nn
 from flash_attn import flash_attn_with_kvcache
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
+from torch.nn.attention import sdpa_kernel
+from ...Config import SDPBACKEND
 from tqdm import tqdm
 
 from .utils import sample
@@ -33,7 +35,8 @@ class T2SBlock(_T2SBlockBase):
         k_cache[:, :L] = k
         v_cache[:, :L] = v
 
-        x = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask)
+        with sdpa_kernel(SDPBACKEND):
+            x = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask)
 
         x = x.transpose(1, 2).view(B, L, self.hidden_dim)
         x = self.out_proj(x)

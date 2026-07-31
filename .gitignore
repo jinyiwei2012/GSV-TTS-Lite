@@ -52,3 +52,12 @@ presets
 
 # Downloaded/local model files for API usage
 models/
+
+# Agent runtime state
+.omo/
+
+# Local speaker model checkpoints & test audio (MultiSpeaker)
+*.ckpt
+*.pth
+*.aac
+test_*.wav

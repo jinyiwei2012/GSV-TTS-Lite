@@ -5,6 +5,8 @@ import logging
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
+from torch.nn.attention import sdpa_kernel
+from ...Config import SDPBACKEND
 from tqdm import tqdm
 
 from .utils import sample
@@ -37,7 +39,8 @@ class T2SBlock(_T2SBlockBase):
         k_cache[:, :, :L] = k
         v_cache[:, :, :L] = v
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        with sdpa_kernel(SDPBACKEND):
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         x = x.transpose(1, 2).reshape(B, L, self.hidden_dim)
         x = self.out_proj(x)
@@ -77,7 +80,8 @@ class T2SBlock(_T2SBlockBase):
 
         # kv_cache shape [batch_size, num_heads, kv_len, head_dim/num_heads]
 
-        x = F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=attn_mask)
+        with sdpa_kernel(SDPBACKEND):
+            x = F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=attn_mask)
         
         x = x.transpose(1, 2).reshape(B, L, self.hidden_dim)
         x = self.out_proj(x)

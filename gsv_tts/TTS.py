@@ -53,7 +53,6 @@ class TTS:
         dtype: str = None,
         use_flash_attn: bool = False,
         use_bert: bool = False,
-        auto_bert: bool = True,
         use_jieba_fast: bool = False,
         always_load_cnhubert: bool = False,
         always_load_sv: bool = False,
@@ -66,10 +65,9 @@ class TTS:
             sovits_cache (list[int]): Static cache sizes for the SoVITS model's CUDA graph.
             models_dir (str): The directory path containing the pretrained model files.
             device (str): The device to run the model on.
-            dtype (str): The data type for model inference (e.g., "float16", "bfloat16", "float32").
+            dtype (str): The data type for model inference (e.g., "float16", "float32").
             use_flash_attn (bool): Whether to enable Flash Attention for faster inference.
             use_bert (bool): Whether to use BERT for enhanced Chinese semantic understanding. If True, BERT is loaded at initialization.
-            auto_bert (bool): Whether to automatically load BERT when Chinese text is detected. Only effective when use_bert=False. Default is True.
             use_jieba_fast (bool): Whether to use jieba-fast for faster Chinese text segmentation. `jieba-fast` needs to be installed.
             always_load_cnhubert (bool): Whether to keep the CNHubert model loaded in VRAM. Set to True to accelerate Voice Conversion.
             always_load_sv (bool): Whether to keep the Speaker Verification model loaded in VRAM. Set to True to accelerate Speaker Verification.
@@ -86,15 +84,12 @@ class TTS:
             dtype_map = {
                 "float32": torch.float32,
                 "float16": torch.float16,
-                "bfloat16": torch.bfloat16
             }
 
             self.tts_config.dtype = dtype_map.get(dtype.lower(), torch.float32)
         
         self.always_load_cnhubert = always_load_cnhubert
         self.always_load_sv = always_load_sv
-        self.auto_bert = auto_bert
-
         if models_dir is None: models_dir = Path.home() / ".cache" / "gsv"
         self.models_dir = models_dir
         if global_config.models_dir is None: global_config.models_dir = models_dir
@@ -102,6 +97,7 @@ class TTS:
         if use_flash_attn:
             try:
                 import flash_attn
+                logging.info("Flash attention is available.")
             except ImportError:
                 use_flash_attn = False
                 logging.error("Flash attention is not available!")
@@ -126,6 +122,7 @@ class TTS:
         ensure_default_models(self.models_dir)
 
         self._bert_loaded = False
+
         if use_bert:
             # CPU 场景：下载 INT8 ONNX 模型
             if self.tts_config.device.type == "cpu":
@@ -139,7 +136,6 @@ class TTS:
                     dir=self.models_dir,
                 )
             self.tts_config.cnroberta = CNRoberta(self.cnroberta_path, self.tts_config)
-            self._bert_loaded = True
         
         self.cnhubert_model = None
         self.sv_model = None
@@ -151,7 +147,7 @@ class TTS:
         self.sovits_hz = 50
 
         self.audio_queue = AudioQueue(self.samplerate)
-        self._infer_lock = threading.Lock()
+        self._infer_lock = threading.RLock()
         
         logging.info(f"Device: {self.tts_config.device}, dtype: {self.tts_config.dtype}")
     
@@ -162,6 +158,8 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
@@ -182,6 +180,8 @@ class TTS:
             prompt_audio_path (str): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_text (str): The transcription (text content) of the prompt audio.
             text (str): The target text to be synthesized into speech.
+            text_language (str, optional): The language of the target text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
+            prompt_language (str, optional): The language of the prompt audio text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
             return_subtitles (bool, optional): Whether to return subtitle information (timestamps) for the generated audio.
             top_k (int, optional): Sampling parameter for the GPT model. Limits the next token selection to the top K most probable tokens.
             top_p (float, optional): Sampling parameter for the GPT model. Limits the next token selection to a cumulative probability of P.
@@ -207,9 +207,6 @@ class TTS:
 
         self._infer_lock.acquire()
         try:
-            if self._contains_chinese(text):
-                self._ensure_bert_loaded()
-            
             if not self._check_pause(text):
                 text += "."
 
@@ -225,12 +222,12 @@ class TTS:
             logging.info(f"Using SoVITS model: {sovits_model}")
 
             sovits, ge = self._prepare_sovits_resources(sovits_model, spk_audio_path)
-            gpt, prompt, phones1, bert1 = self._prepare_gpt_resources(gpt_model, prompt_audio_path, prompt_audio_text)
+            gpt, prompt, phones1, bert1 = self._prepare_gpt_resources(gpt_model, prompt_audio_path, prompt_audio_text, prompt_language)
             t2s_model = gpt.t2s_model
             vq_model = sovits.vq_model
 
             logging.info("Processing text to phones and BERT features...")
-            phones2, word2ph, bert2, norm_text = get_phones_and_bert(text, self.tts_config)
+            phones2, word2ph, bert2, norm_text = get_phones_and_bert(text, self.tts_config, text_language)
             all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.tts_config.device).unsqueeze(0)
             bert = torch.cat([bert1, bert2]).unsqueeze(0)
 
@@ -299,6 +296,8 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
@@ -328,6 +327,8 @@ class TTS:
             prompt_audio_path (str): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_text (str): The transcription (text content) of the prompt audio.
             text (str): The target text to be synthesized into speech.
+            text_language (str, optional): The language of the target text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
+            prompt_language (str, optional): The language of the prompt audio text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
             return_subtitles (bool, optional): Whether to return subtitle information (timestamps) for the generated audio.
             is_cut_text (bool, optional): Whether to split the input text into smaller segments based on punctuation.
             cut_minlen (int, optional): The minimum length of a text segment. Segments shorter than this will be merged.
@@ -345,7 +346,7 @@ class TTS:
             speed (float, optional): Speed factor for the generated audio. 1.0 is normal speed, >1.0 is faster, <1.0 is slower.
             gpt_model (str, optional): The GPT model to use for the inference.
             sovits_model (str, optional): The SoVITS model to use for the inference.
-            debug (bool, optional): When set to “False”, certain outputs can be suppressed.
+            debug (bool, optional): When set to "False", certain outputs can be suppressed.
 
         Yields:
             AudioClip: An object encapsulating a chunk of the generated audio stream, which includes:
@@ -362,9 +363,6 @@ class TTS:
 
         self._infer_lock.acquire()
         try:
-            if self._contains_chinese(text):
-                self._ensure_bert_loaded()
-            
             if not self._check_pause(text):
                 text += "."
 
@@ -388,7 +386,7 @@ class TTS:
             logging.info(f"Using SoVITS model: {sovits_model}")
 
             sovits, ge = self._prepare_sovits_resources(sovits_model, spk_audio_path)
-            gpt, prompt, phones1, bert1 = self._prepare_gpt_resources(gpt_model, prompt_audio_path, prompt_audio_text)
+            gpt, prompt, phones1, bert1 = self._prepare_gpt_resources(gpt_model, prompt_audio_path, prompt_audio_text, prompt_language)
             t2s_model = gpt.t2s_model
             vq_model = sovits.vq_model
 
@@ -402,7 +400,7 @@ class TTS:
             for i, text_cut in enumerate(text_cuts):
                 if debug: logging.info(f"Processing segment {i+1}/{len(text_cuts)}: '{text_cut}'")
 
-                phones2, word2ph, bert2, norm_text = get_phones_and_bert(text_cut, self.tts_config)
+                phones2, word2ph, bert2, norm_text = get_phones_and_bert(text_cut, self.tts_config, text_language)
 
                 curr_phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.tts_config.device).unsqueeze(0)
                 curr_bert = torch.cat([bert1, bert2]).unsqueeze(0)
@@ -529,6 +527,7 @@ class TTS:
         texts, spk_audio_paths, prompt_audio_paths, prompt_audio_texts,
         return_subtitles, is_cut_text, cut_minlen, cut_mute,
         cut_mute_scale_map, speed, bert_batch_size, gpt_model, sovits_model,
+        text_languages="auto", prompt_languages="auto",
     ) -> _BatchedInputs:
         """Prepare all inputs for batched GPT+SoVITS inference.
 
@@ -562,6 +561,10 @@ class TTS:
             prompt_audio_paths = [prompt_audio_paths] * n
         if isinstance(prompt_audio_texts, str):
             prompt_audio_texts = [prompt_audio_texts] * n
+        if isinstance(text_languages, str):
+            text_languages = [text_languages] * n
+        if isinstance(prompt_languages, str):
+            prompt_languages = [prompt_languages] * n
 
         gpt_model = self._resolve_gpt_model(gpt_model)
         sovits_model = self._resolve_sovits_model(sovits_model)
@@ -593,6 +596,8 @@ class TTS:
         spk_audio_paths = _expand(spk_audio_paths)
         prompt_audio_paths = _expand(prompt_audio_paths)
         prompt_audio_texts = _expand(prompt_audio_texts)
+        text_languages = _expand(text_languages)
+        prompt_languages = _expand(prompt_languages)
 
         orig_texts = texts
         texts = all_segments
@@ -607,7 +612,8 @@ class TTS:
 
         for i in tqdm(range(0, len(texts), bert_batch_size)):
             batch = texts[i: i + bert_batch_size]
-            bp, bw, bb, bn = get_phones_and_bert(batch, self.tts_config)
+            batch_text_languages = text_languages[i: i + bert_batch_size]
+            bp, bw, bb, bn = get_phones_and_bert(batch, self.tts_config, batch_text_languages)
             all_phones2.extend(bp)
             all_word2ph.extend(bw)
             all_bert2.extend(bb)
@@ -620,12 +626,13 @@ class TTS:
         all_ge = []
 
         for items in zip(spk_audio_paths, prompt_audio_paths,
-                          prompt_audio_texts, all_phones2, all_bert2):
-            (spk_path, prm_path, prm_text, phones2, bert2) = items
+                          prompt_audio_texts, all_phones2, all_bert2, prompt_languages):
+            (spk_path, prm_path, prm_text, phones2, bert2, prm_lang) = items
 
             if prm_path not in self.prompt_audio_cache:
                 self.cache_prompt_audio(prompt_audio_paths=prm_path,
-                                         prompt_audio_texts=prm_text)
+                                         prompt_audio_texts=prm_text,
+                                         prompt_language=prm_lang)
 
             prompt = self.prompt_audio_cache[prm_path]["prompt"]
             phones1 = self.prompt_audio_cache[prm_path]["phones1"]
@@ -886,6 +893,8 @@ class TTS:
         prompt_audio_paths: str | list[str],
         prompt_audio_texts: str | list[str],
         texts: str | list[str],
+        text_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
+        prompt_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
@@ -912,6 +921,8 @@ class TTS:
             prompt_audio_paths (str | list[str]): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_texts (str | list[str]): The transcription (text content) of the prompt audio.
             texts (str | list[str]): The target text to be synthesized into speech.
+            text_languages (Literal["auto", "ja", "zh", "en"] | list[str], optional): The language of each target text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
+            prompt_languages (Literal["auto", "ja", "zh", "en"] | list[str], optional): The language of each prompt audio text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English).
             return_subtitles (bool, optional): Whether to return subtitle information (timestamps) for the generated audio.
             is_cut_text (bool, optional): Whether to split the input text into smaller segments based on punctuation.
             cut_minlen (int, optional): The minimum length of a text segment. Segments shorter than this will be merged.
@@ -958,6 +969,8 @@ class TTS:
                 bert_batch_size=bert_batch_size,
                 gpt_model=gpt_model,
                 sovits_model=sovits_model,
+                text_languages=text_languages,
+                prompt_languages=prompt_languages,
             )
 
             # Resolve models for inference
@@ -987,6 +1000,7 @@ class TTS:
         spk_audio_path: str | dict,
         prompt_audio_path: str,
         prompt_audio_text: str,
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         noise_scale: float = 0.5,
         speed: float = 1.0,
         sovits_model: str = None,
@@ -1000,6 +1014,7 @@ class TTS:
                 - If a `dict`, it enables multi-speaker fusion. The format is `{"audio_file_path.wav": weight}`,
             prompt_audio_path (str): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_text (str): The transcription (text content) of the prompt audio.
+            prompt_language (str, optional): The language of the prompt audio text. Supported options are "auto" (auto-detect), "ja" (Japanese), "zh" (Chinese), and "en" (English). Defaults to "auto".
             noise_scale (float, optional): Controls the standard deviation of the acoustic distribution in the SoVITS decoder. A certain amount of noise can enhance audio naturalness.
             speed (float, optional): Speed factor for the generated audio. 1.0 is normal speed, >1.0 is faster, <1.0 is slower.
             sovits_model (str, optional): The SoVITS model to use for the inference.
@@ -1041,7 +1056,7 @@ class TTS:
                 self.cnhubert_model = None
 
             logging.info("Processing text to phones and BERT features...")
-            phones, word2ph, _, norm_text = get_phones_and_bert(prompt_audio_text, self.tts_config)
+            phones, word2ph, _, norm_text = get_phones_and_bert(prompt_audio_text, self.tts_config, prompt_language)
 
             phones_tensor = torch.LongTensor(phones).to(self.tts_config.device).unsqueeze(0)
 
@@ -1085,6 +1100,8 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
@@ -1114,6 +1131,8 @@ class TTS:
                 prompt_audio_path=prompt_audio_path,
                 prompt_audio_text=prompt_audio_text,
                 text=text,
+                text_language=text_language,
+                prompt_language=prompt_language,
                 return_subtitles=return_subtitles,
                 top_k=top_k,
                 top_p=top_p,
@@ -1136,6 +1155,8 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        text_language: Literal["auto", "ja", "zh", "en"] = "auto",
+        prompt_language: Literal["auto", "ja", "zh", "en"] = "auto",
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
@@ -1177,6 +1198,8 @@ class TTS:
                     prompt_audio_path=prompt_audio_path,
                     prompt_audio_text=prompt_audio_text,
                     text=text,
+                    text_language=text_language,
+                    prompt_language=prompt_language,
                     return_subtitles=return_subtitles,
                     is_cut_text=is_cut_text,
                     cut_minlen=cut_minlen,
@@ -1217,6 +1240,8 @@ class TTS:
         prompt_audio_paths: str | list[str],
         prompt_audio_texts: str | list[str],
         texts: str | list[str],
+        text_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
+        prompt_languages: Literal["auto", "ja", "zh", "en"] | list[str] = "auto",
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
@@ -1252,6 +1277,8 @@ class TTS:
                 prompt_audio_paths=prompt_audio_paths,
                 prompt_audio_texts=prompt_audio_texts,
                 texts=texts,
+                text_languages=text_languages,
+                prompt_languages=prompt_languages,
                 return_subtitles=return_subtitles,
                 is_cut_text=is_cut_text,
                 cut_minlen=cut_minlen,
@@ -1290,12 +1317,12 @@ class TTS:
             return next(iter(self.sovits_models))
         return self.default_sovits_path
     
-    def _prepare_gpt_resources(self, gpt_model, prompt_audio_path, prompt_audio_text):
+    def _prepare_gpt_resources(self, gpt_model, prompt_audio_path, prompt_audio_text, prompt_language):
         if gpt_model not in self.gpt_models:
             self.load_gpt_model(gpt_model)
 
         if prompt_audio_path not in self.prompt_audio_cache:
-            self.cache_prompt_audio(prompt_audio_paths=prompt_audio_path, prompt_audio_texts=prompt_audio_text)
+            self.cache_prompt_audio(prompt_audio_paths=prompt_audio_path, prompt_audio_texts=prompt_audio_text, prompt_language=prompt_language)
 
         prompt = self.prompt_audio_cache[prompt_audio_path]["prompt"]
         phones1 = self.prompt_audio_cache[prompt_audio_path]["phones1"]
@@ -1517,7 +1544,7 @@ class TTS:
             self._empty_cache()
     
     @torch.inference_mode()
-    def cache_prompt_audio(self, prompt_audio_paths: str|list[str], prompt_audio_texts: str|list[str]):
+    def cache_prompt_audio(self, prompt_audio_paths: str|list[str], prompt_audio_texts: str|list[str], prompt_language: Literal["auto", "ja", "zh", "en"] = "auto"):
         """
         Pre-processes and caches prompt audio data for faster inference.
 
@@ -1525,6 +1552,7 @@ class TTS:
             prompt_audio_paths (str | list[str]): Path(s) to the prompt audio file(s).
             prompt_audio_texts (str | list[str]): Transcription(s) of the prompt audio. 
                 If a single string is provided with multiple paths, it will be applied to all.
+            prompt_language (str, optional): The language of the prompt audio text. Defaults to "auto".
         """
         try:
             if not self.sovits_models:
@@ -1548,7 +1576,7 @@ class TTS:
                         "Please provide the text transcription for the reference audio (风格参考音频对应文本)."
                     )
                 prompt = self._get_prompt(self.cnhubert_model, model, prompt_audio_path)
-                phones1, _, bert1, _ = get_phones_and_bert(prompt_audio_text, self.tts_config)
+                phones1, _, bert1, _ = get_phones_and_bert(prompt_audio_text, self.tts_config, prompt_language)
                 self.prompt_audio_cache[prompt_audio_path] = {
                     "prompt": prompt,
                     "phones1": phones1,

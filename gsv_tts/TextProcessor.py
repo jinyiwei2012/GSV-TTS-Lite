@@ -71,10 +71,11 @@ def cut_text(text, cut_minlen=10):
     return text_cuts
 
 
-def get_phones_and_bert(texts, tts_config: Config):
+def get_phones_and_bert(texts, tts_config: Config, languages):
     is_batch = True
     if isinstance(texts, str):
         texts = [texts]
+        languages = [languages]
         is_batch = False
 
     batch_phones = []
@@ -84,8 +85,26 @@ def get_phones_and_bert(texts, tts_config: Config):
 
     bert_tasks = {"pos":[], "word2ph":[]}
 
-    for text in texts:
-        segments = LangSegment.getTexts(text)
+    for text, language in zip(texts, languages):
+        if language == "en":
+            segments = [{"lang": "en", "text": text}]
+        elif language == "auto":
+            segments = LangSegment.getTexts(text)
+        else:
+            all_segments = LangSegment.getTexts(text)
+            segments = []
+            for s in all_segments:
+                if s["lang"] == "en":
+                    parts = re.split(r'(\d+)', s["text"])
+                    for part in parts:
+                        if not part or not re.search(r'\w', part):
+                            continue
+                        if part.isdigit():
+                            segments.append({"lang": language, "text": part})
+                        else:
+                            segments.append({"lang": "en", "text": part})
+                else:
+                    segments.append({"lang": language, "text": s["text"]})
 
         if not segments:
             raise ValueError(
@@ -135,7 +154,6 @@ def get_phones_and_bert(texts, tts_config: Config):
         return batch_phones, batch_word2ph, batch_bert, batch_norm_text
     else:
         return batch_phones[0], batch_word2ph[0], batch_bert[0], batch_norm_text[0]
-
 
 def split_text(text):
     pattern = re.compile(r'[a-zA-Z]+|.', flags=re.DOTALL)

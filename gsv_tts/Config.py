@@ -8,6 +8,8 @@ documentation or introspection).
 import os
 import logging
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 # -----------------------------------------------------------
 # Named constants for SM version thresholds
@@ -70,6 +72,41 @@ def get_mps_device_info():
         return None
 
 
+def choose_attention_backend(batch=1, heads=8, seq=128, head_dim=64, dtype=torch.float16):
+    """Probe the fastest available SDPA backend on the current device."""
+    if not torch.cuda.is_available():
+        logging.info("SDPBackend: MATH")
+        return SDPBackend.MATH
+
+    k = torch.randn(batch, heads, seq, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch, heads, seq, head_dim, device="cuda", dtype=dtype)
+
+    probes = []
+    for q_len in (seq, 1):
+        q = torch.randn(batch, heads, q_len, head_dim, device="cuda", dtype=dtype)
+        mask = torch.zeros(batch, heads, q_len, seq, device="cuda", dtype=torch.bool)
+        probes.append((q, mask))
+
+    def is_usable(backend):
+        try:
+            for q, mask in probes:
+                with sdpa_kernel(backend):
+                    F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            return True
+        except Exception:
+            return False
+
+    if is_usable(SDPBackend.CUDNN_ATTENTION):
+        logging.info("SDPBackend: CUDNN_ATTENTION")
+        return SDPBackend.CUDNN_ATTENTION
+    elif is_usable(SDPBackend.EFFICIENT_ATTENTION):
+        logging.info("SDPBackend: EFFICIENT_ATTENTION")
+        return SDPBackend.EFFICIENT_ATTENTION
+    else:
+        logging.info("SDPBackend: MATH")
+        return SDPBackend.MATH
+
+
 # -----------------------------------------------------------
 # Cached lazy device / dtype detection
 # -----------------------------------------------------------
@@ -79,6 +116,7 @@ _DTYPE_CACHE: torch.dtype | None = None
 
 def _detect_device() -> torch.device:
     """Run full device detection (called once, cache on first access)."""
+    global _DTYPE_CACHE
     # CUDA
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
@@ -90,14 +128,12 @@ def _detect_device() -> torch.device:
         if available_devices:
             # Prefer highest SM version, then most memory
             best = max(available_devices, key=lambda x: (x[2], x[3]))
-            global _DTYPE_CACHE
             _DTYPE_CACHE = best[1]
             return best[0]
 
     # MPS (Apple Silicon)
     mps = get_mps_device_info()
     if mps is not None:
-        global _DTYPE_CACHE
         _DTYPE_CACHE = torch.float32
         return mps[0]
 
@@ -160,3 +196,6 @@ class GlobalConfig:
 
 
 global_config = GlobalConfig()
+
+# Probe the best SDPA backend once at import time (kept for API compatibility).
+SDPBACKEND = choose_attention_backend()

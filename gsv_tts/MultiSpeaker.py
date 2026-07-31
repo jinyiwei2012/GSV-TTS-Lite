@@ -175,6 +175,10 @@ class MultiSpeakerTTS:
         # ── Extract per-speaker weights ──
         self._speakers: dict[str, SpeakerWeights] = {}
         self._shared_gpt_layers = shared_gpt_layers  # store for logging
+        # ── Weight cache: avoid re-extracting when multiple speakers
+        #     share the same checkpoint (multi-speaker model files)
+        self._weight_cache: dict[tuple[str, str], tuple[dict, dict]] = {}
+        #     key = (gpt_path, sovits_path) → (gpt_weights, sovits_weights)
 
         for i, spk in enumerate(speakers):
             logger.info(
@@ -184,11 +188,6 @@ class MultiSpeakerTTS:
 
         # ── Active speaker tracking ──
         self._active_speaker: str | None = None
-
-        # ── Weight cache: avoid re-extracting when multiple speakers
-        #     share the same checkpoint (multi-speaker model files)
-        self._weight_cache: dict[tuple[str, str], tuple[dict, dict]] = {}
-        #     key = (gpt_path, sovits_path) → (gpt_weights, sovits_weights)
 
         # ── Expose shared resources ──
         self.audio_queue = self._tts.audio_queue
