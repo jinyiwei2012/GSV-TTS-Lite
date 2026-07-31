@@ -80,6 +80,25 @@
 **Core optimization technologies:** CUDA Graph, Nested KV Cache, and Continuous Batching.
 <br>
 
+## MultiSpeakerTTS 共有骨格の実測ベンチマーク
+
+> [!NOTE]
+> **テスト環境**：CPU 参考環境（GPU なし）。実在のファインチューニングモデル（CyreneV3.7 / shouanren / LuoTianyi、v2ProPlus 互換アーキテクチャ）を使用、短文推論の平均値。
+
+| 指標 | 共有骨格 | 全量ロード | 説明 |
+| :--- | :---: | :---: | :--- |
+| 話者あたり平均推論遅延 | 0.7~0.9s | 0.8~0.9s | ⚖️ 性能損失なし |
+| ピークメモリ (RAM) | **2.77 GB** | 4.65 GB | 💾 **-40%**（CPU 実測） |
+| 3話者初期化時間 | 30.0s | 16.2s | 初回のみの重み抽出。以降の話者切替はゼロコスト |
+
+> [!IMPORTANT]
+> **アーキテクチャ互換性検証**（実モデル）：
+> - ✅ CyreneV3.7、shouanren、LuoTianyi（Agent-LuoTianyi プロジェクトのモデル）→ 共有骨格モード（25 GPT keys + 37 SoVITS keys のみ抽出）
+> - ⚠️ aimisi（v2 アーキテクチャ、`upsample_initial_channel=512` vs base `768`）→ **自動的に完全モデルロードへデグレード**。他の話者には影響なし
+>
+> メモリ節約は共有話者数の増加に伴い拡大（2話者 -17% → 3話者 -40%）。GPU 環境では CPU 実測値よりもはるかに大きな VRAM 節約が期待できます（重み注入はメモリ帯域に依存しないため。VRAM 比較は上記 MultiSpeaker 表を参照）。推論遅延は全量ロードと同等で、利点はメモリとマルチ話者並列処理に集中します。
+<br>
+
 ## 開発者向けデプロイ (Deployment)
 
 ### 環境準備

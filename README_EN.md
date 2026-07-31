@@ -80,6 +80,25 @@ As shown, **GSV-TTS-Lite** achieves **3x ~ 4x** speed improvements while **halvi
 **Core optimization technologies:** CUDA Graph, Nested KV Cache, and Continuous Batching.
 <br>
 
+## MultiSpeakerTTS Shared-Backbone Benchmarks
+
+> [!NOTE]
+> **Test environment**: CPU reference environment (no GPU), using real fine-tuned models (CyreneV3.7 / shouanren / LuoTianyi, v2ProPlus-compatible architecture), average of short-text inference runs.
+
+| Metric | Shared Backbone | Full Loading | Notes |
+| :--- | :---: | :---: | :--- |
+| Per-speaker avg inference latency | 0.7~0.9s | 0.8~0.9s | ⚖️ No performance loss |
+| Peak memory (RAM) | **2.77 GB** | 4.65 GB | 💾 **-40%** (CPU measured) |
+| 3-speaker init time | 30.0s | 16.2s | One-time weight extraction; zero-cost speaker switching afterwards |
+
+> [!IMPORTANT]
+> **Architecture compatibility validation** (real models):
+> - ✅ CyreneV3.7, shouanren, LuoTianyi (Agent-LuoTianyi project model) → shared-backbone mode (only 25 GPT keys + 37 SoVITS keys extracted)
+> - ⚠️ aimisi (v2 architecture, `upsample_initial_channel=512` vs base `768`) → **auto-degrades** to full model loading without affecting other speakers
+>
+> Memory savings grow with the number of shared speakers (-17% with 2 → -40% with 3). GPU VRAM savings are far higher than the CPU figures above (weight injection is not bandwidth-bound; see the MultiSpeaker VRAM comparison table above); inference latency is on par with full loading — the gains are in memory and multi-speaker concurrency.
+<br>
+
 ## Deployment (For Developers)
 
 ### Prerequisites
